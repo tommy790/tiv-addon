@@ -90,6 +90,33 @@ local function GrabberOrigin(veh, mountLocal, spikeWorldPos)
     return pos
 end
 
+-- Which model the grabber bodies get. Wiremod's own grabber model first, then
+-- the grabber tool's default, then stock sandbox props as a last resort -- a
+-- Wiremod build that has been trimmed down still gets a body that can spawn.
+-- The choice is cached; nil (nothing valid on this server) is cached too so a
+-- broken install is probed once, not on every spike of every deploy.
+local GRABBER_MODEL_CANDIDATES = {
+    "models/jaanus/wiretool/wiretool_grabber_forcer.mdl",
+    "models/jaanus/wiretool/wiretool_range.mdl",
+    "models/props_junk/plasticcrate01a.mdl",
+    "models/props_junk/cardboard_box004a.mdl",
+}
+local chosenModel = false   -- false = not resolved yet, nil = nothing usable
+
+local function GrabberModel()
+    if chosenModel ~= false then return chosenModel end
+    for _, model in ipairs(GRABBER_MODEL_CANDIDATES) do
+        if util.IsValidModel(model) then
+            chosenModel = model
+            return chosenModel
+        end
+    end
+    chosenModel = nil
+    print("[TIV] No usable Wire Grabber model found on this server - falling back to ballsocket holds")
+    return chosenModel
+end
+TIV.WireAnchor.GrabberModel = GrabberModel
+
 local function TagGrabber(grabber, veh, data, spikeData)
     grabber:SetNWBool("TIV_Spike", true)
     grabber:SetNWEntity("TIV_OwnerVehicle", veh)
@@ -137,10 +164,28 @@ function TIV.WireAnchor.CreateGrabber(veh, data, spikeData)
     local grabber = ents.Create(GRABBER_CLASS)
     if not IsValid(grabber) then return nil end
 
+    -- The grabber SENT calls self:PhysicsInit(SOLID_VPHYSICS) and then
+    -- self:GetPhysicsObject():SetMass(10) inside its own Initialize, so it must
+    -- have a model BEFORE Spawn or PhysicsInit produces nothing and the SetMass
+    -- errors with "Tried to use a NULL physics object!". Wiremod normally
+    -- supplies the model through WireLib.MakeWireEnt from the tool's model
+    -- list; created directly like this it has none at all.
+    grabber:SetModel(GrabberModel())
+
     grabber:SetPos(pos)
     grabber:SetAngles(AimUpAt(pos, spike:GetPos()))
     grabber:Spawn()
     grabber:Activate()
+
+    -- Belt and braces: if no candidate model turned out to be valid on this
+    -- server, the body has no physics and cannot be welded or grabbed. Drop it
+    -- and let the caller fall back to a ballsocket hold rather than leaving a
+    -- broken anchor behind.
+    if not IsValid(grabber:GetPhysicsObject()) then
+        print("[TIV] Wire grabber spawned without a physics object (no valid model?) - using a ballsocket hold instead")
+        grabber:Remove()
+        return nil
+    end
 
     local owner = TIV.ResolveOwner and TIV.ResolveOwner(veh) or nil
     if IsValid(owner) then
