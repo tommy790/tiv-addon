@@ -78,6 +78,30 @@ local function VehicleMass(veh)
     return IsValid(phys) and math.max(phys:GetMass(), 100) or 800
 end
 
+-- Every hold in this system is cut through here, so the flag set cannot drift
+-- between the first cut, the stressed re-cut and the world anchors.
+--
+-- onlyRotation is deliberately 0. It means "only limit rotation, free
+-- movement": with it set the constraint pins nothing positionally, so a live
+-- spike is held by its soil springs alone -- it slides out of the ground and
+-- swings on the end of the gimbal. Positional pinning is what makes the spike
+-- behave like a ram bolted to the chassis, and the gimbal's friction is what
+-- stops it oscillating inside its cone afterwards.
+local function CutHoldSocket(veh, ent2, localPos, forceLimit, torqueLimit)
+    local limit    = math.Clamp(TIV.AnchorSetting("SpikePivotLimit", 10), 1, 60)
+    local friction = math.max(0, TIV.AnchorSetting("SpikePivotFriction", 40))
+    return constraint.AdvBallsocket(
+        veh, ent2, 0, 0,
+        localPos, vector_origin,
+        forceLimit, torqueLimit,
+        -limit, -limit, -limit,
+         limit,  limit,  limit,
+        friction, friction, friction,
+        0,      -- onlyRotation: 0 = pin position, 1 = free movement
+        0       -- noCollide: this system keeps its own explicit pairs
+    )
+end
+
 -- The force/torque limits of a Source constraint are read once, at Spawn, from
 -- the entity's keyvalues -- they are not live Lua fields. The only way to give
 -- an existing hold a new break number is to cut a new one. This does that in a
@@ -100,7 +124,6 @@ local function RecutHold(veh, data, rec, forceLimit, torqueLimit)
     if not ent2 or not IsValid(ent2) then return false end
 
     if rec.type == "ballsocket" then
-        local limit = math.Clamp(TIV.AnchorSetting("SpikePivotLimit", 22), 2, 60)
         local localPos
         if ent2:IsWorld() then
             localPos = rec.localPos or vector_origin
@@ -108,15 +131,7 @@ local function RecutHold(veh, data, rec, forceLimit, torqueLimit)
             localPos = veh:WorldToLocal(ent2:GetPos())
         end
 
-        local replacement = constraint.AdvBallsocket(
-            veh, ent2, 0, 0,
-            localPos, vector_origin,
-            forceLimit, torqueLimit,
-            -limit, -limit, -limit,
-             limit,  limit,  limit,
-            0, 0, 0,
-            1, 0
-        )
+        local replacement = CutHoldSocket(veh, ent2, localPos, forceLimit, torqueLimit)
         if not IsValid(replacement) then return false end
 
         local old = rec.constraint
@@ -277,13 +292,19 @@ function TIV.Anchor.PlantSingle(veh, data, spikeData)
         sp:SetAngles(ang)
         sp:SetVelocity(vector_origin)
         sp:SetAngleVelocity(vector_origin)
-        sp:SetMass(math.max(15, sp:GetMass()))
+        sp:SetMass(math.max(15, TIV.AnchorSetting("SpikeMass", 40)))
         sp:EnableGravity(true)
-        -- Live body. Freezing it here and welding it to the world is exactly
-        -- the "rigid world-locked prop" behaviour this system replaces: a
-        -- frozen spike drags the whole chassis flat instead of letting it tilt.
-        sp:EnableMotion(true)
-        sp:Wake()
+        -- Held frozen at the planted pose until its hold is cut. Spikes plant
+        -- one at a time (staggered by group) but the holds are all cut together
+        -- once the last one is home, so a spike released here would be a live
+        -- body with nothing positional holding it for a quarter of a second --
+        -- long enough to drop out of the ground and be captured in the wrong
+        -- place. AttachSingle lets it go the instant it is actually held.
+        --
+        -- It is never welded to the world: that is the "rigid world-locked
+        -- prop" behaviour this system replaces.
+        sp:EnableMotion(false)
+        spikeData.pendingMotion = true
     end
 
     -- The spike passes through its own vehicle's hull on the way down; without
@@ -571,20 +592,11 @@ local function AttachWithBallsocket(veh, data, spikeData, spikeTableIndex)
         sp:SetAngleVelocity(vector_origin)
     end
 
-    local limit = math.Clamp(TIV.AnchorSetting("SpikePivotLimit", 22), 2, 60)
     local force = TIV.AnchorHoldForce(data.anchorStressed == true)
     local torque = TIV.AnchorHoldTorque(data.anchorStressed == true)
     local localAttachPos = veh:WorldToLocal(spike:GetPos())
 
-    local bs = constraint.AdvBallsocket(
-        veh, spike, 0, 0,
-        localAttachPos, vector_origin,
-        force, torque,
-        -limit, -limit, -limit,
-         limit,  limit,  limit,
-        0, 0, 0,
-        1, 0
-    )
+    local bs = CutHoldSocket(veh, spike, localAttachPos, force, torque)
     if not IsValid(bs) then
         print("[TIV] WARNING: Ballsocket failed for spike " .. tostring(spikeData.index))
         return false
@@ -607,16 +619,37 @@ local function AttachWithBallsocket(veh, data, spikeData, spikeTableIndex)
     return true
 end
 
+-- Lets a planted spike become a live body. Called the moment its hold exists,
+-- never before: from here on the spike is held positionally by the chassis and
+-- by its own soil anchors, so it can move, tilt and be dragged out -- but it
+-- cannot simply fall out of the ground while nothing is holding it.
+local function ReleaseSpikeMotion(spikeData)
+    if not spikeData or not spikeData.pendingMotion then return end
+    spikeData.pendingMotion = nil
+    local spike = spikeData.entity
+    if not IsValid(spike) then return end
+    local sp = spike:GetPhysicsObject()
+    if not IsValid(sp) then return end
+    sp:SetVelocity(vector_origin)
+    sp:SetAngleVelocity(vector_origin)
+    sp:EnableMotion(true)
+    sp:Wake()
+end
+
 function TIV.Anchor.AttachSingle(veh, data, spikeData, spikeTableIndex)
     if not IsValid(veh) or not IsValid(spikeData.entity) then return end
 
     -- Whichever anchoring method is available, automatically. Wiremod present
     -- and grabbers enabled: the spike hold is a Wire Grabber weld. Otherwise
     -- (or if the grab refused) the ballsocket hold does exactly the same job.
+    local held
     if TIV.WireAnchor and TIV.WireAnchor.IsAvailable() then
-        if AttachWithGrabber(veh, data, spikeData, spikeTableIndex) then return end
+        held = AttachWithGrabber(veh, data, spikeData, spikeTableIndex)
     end
-    AttachWithBallsocket(veh, data, spikeData, spikeTableIndex)
+    if not held then
+        held = AttachWithBallsocket(veh, data, spikeData, spikeTableIndex)
+    end
+    if held then ReleaseSpikeMotion(spikeData) end
 end
 
 local function HasHold(data, spikeIndex)
@@ -648,20 +681,11 @@ function TIV.Anchor.AttachWorld(veh, data)
     if not IsValid(veh) then return end
     local world = game.GetWorld()
     if not world then return end
-    local limit = math.Clamp(TIV.AnchorSetting("SpikePivotLimit", 22), 2, 60)
     local force = TIV.AnchorHoldForce(true)
     local torque = TIV.AnchorHoldTorque(true)
     local created = 0
     for _, mountLocal in ipairs(MountPoints(veh, data)) do
-        local bs = constraint.AdvBallsocket(
-            veh, world, 0, 0,
-            mountLocal, veh:LocalToWorld(mountLocal),
-            force, torque,
-            -limit, -limit, -limit,
-             limit,  limit,  limit,
-            0, 0, 0,
-            1, 0
-        )
+        local bs = CutHoldSocket(veh, world, mountLocal, force, torque)
         if IsValid(bs) then
             Track(data, bs, nil, "ballsocket", {
                 isWorldAnchor = true,
@@ -708,7 +732,12 @@ TIV.Anchor.EnsureLive = TIV.Anchor.UnfreezeForDeploy
 -- actually is -- nothing is scripted.
 function TIV.Anchor.UpdateSpikeLoad(veh, data, sd)
     if not sd or not IsValid(sd.entity) then return end
-    if sd.phase ~= "deployed" or not sd.plantedPos then
+    -- "deployed" is a spike still gripping the soil; "slipping" is the same
+    -- spike one think later, after it reported strain. Both still have to be
+    -- measured, or a spike that complained once would have its load zeroed on
+    -- the next tick and could never reach the point where it lets go -- it
+    -- would just strain forever while its hole stopped holding it.
+    if (sd.phase ~= "deployed" and sd.phase ~= "slipping") or not sd.plantedPos then
         sd.pullDist, sd.slipDist, sd.load = 0, 0, 0
         return
     end
@@ -940,12 +969,13 @@ function TIV.Anchor.UnplantSingle(veh, data, spikeIndex)
     end
     for _, sd in ipairs(data.spikes or {}) do
         if sd.index == spikeIndex then
-            sd.slipped     = nil
-            sd.slipNoticed = nil
-            sd.plantedPos  = nil
-            sd.pullDist    = 0
-            sd.slipDist    = 0
-            sd.load        = 0
+            sd.slipped       = nil
+            sd.slipNoticed   = nil
+            sd.plantedPos    = nil
+            sd.pendingMotion = nil
+            sd.pullDist      = 0
+            sd.slipDist      = 0
+            sd.load          = 0
         end
     end
 end

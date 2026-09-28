@@ -284,9 +284,15 @@ local function FinalizeAnchored(veh, data)
 
     TIV.Anchor.AttachAll(veh, data)
     if TIV.Spikes.GetCount(data) == 0 then
+        -- No spikes: the chassis is pinned to the world directly, so the
+        -- airbags have nothing left to do.
         TIV.Anchor.AttachWorld(veh, data)
         TIV.Anchor.ReleaseSprings(veh, data)
-    else
+    elseif not tobool(TIV.AnchorSetting("KeepAirbagsWhileAnchored", true)) then
+        -- Legacy behaviour: drop the airbag at every mount a planted spike now
+        -- covers. Safe when the spikes are rigid, but the spikes are live
+        -- bodies held by soft soil anchors now, so by default the airbags stay
+        -- inflated and keep the chassis pressed down on its suspension.
         TIV.Anchor.ReleaseCoveredSprings(veh, data)
     end
     TIV.Anchor.UnfreezeForDeploy(veh)

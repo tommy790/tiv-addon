@@ -46,8 +46,26 @@ TIV.Config.Anchor = {
     StressedTorqueLimit = 50000,
 
     -- How far a gimbaled hold may swing, in degrees. The spike is a piston in
-    -- a gimbal, not a weld: it must be able to lean as the chassis tilts.
-    SpikePivotLimit = 22,
+    -- a gimbal, not a weld: it must be able to lean as the chassis tilts, but
+    -- a wide cone reads as a spike flapping on the end of a stick.
+    SpikePivotLimit = 10,
+
+    -- Rotational friction in the gimbal, per axis. Without this the spike is a
+    -- free pendulum inside its cone and oscillates for a long time after
+    -- anything disturbs it -- this is what makes a planted spike hold still.
+    SpikePivotFriction = 40,
+
+    -- Mass given to a planted spike. Heavier spikes are less twitchy under the
+    -- solver and take a real pull to move, which is what an anchor driven into
+    -- the ground should feel like.
+    SpikeMass = 40,
+
+    -- Keep the airbag springs inflated for the whole anchored state instead of
+    -- dropping the ones a planted spike now covers. The airbags are what hold
+    -- the chassis down on its suspension; the spikes resist being dragged off.
+    -- Turning this off returns to the old behaviour of removing the covered
+    -- springs once the spikes are in.
+    KeepAirbagsWhileAnchored = true,
 
     -- ========================================================================
     -- GROUND EMBED (per-spike soil grip)
@@ -59,9 +77,12 @@ TIV.Config.Anchor = {
     -- them being decorative.
     EmbedConstant = 6000,
 
-    -- Soil damping, in N per unit/s. Keeps the anchors from ringing like a bell
-    -- every time the vehicle rocks.
-    EmbedDamping = 400,
+    -- Soil damping, in N per unit/s. At the default stiffness and a ~800 kg
+    -- chassis on six spikes, critical damping is about 1800 per spike; this
+    -- sits just under it so the vehicle settles onto its anchors in one pass
+    -- instead of ringing at roughly 1 Hz for several seconds. Lower it and the
+    -- whole vehicle bobs on its spikes.
+    EmbedDamping = 1500,
 
     -- How far below the spike's own origin the soil anchor points sit. Also the
     -- rest length of the two springs, so this is how much slack the spike has
