@@ -192,6 +192,10 @@ function TIV.Spikes.RemoveAll(data, entIndex)
     end
 
     for _, spikeData in ipairs(data.spikes or {}) do
+        if spikeData.grabber and TIV.WireAnchor then
+            TIV.WireAnchor.Remove(spikeData.grabber)
+            spikeData.grabber = nil
+        end
         if IsValid(spikeData.entity) then
             spikeData.entity:SetParent(nil)
             SafeRemoveEntity(spikeData.entity)
@@ -210,6 +214,10 @@ end
 function TIV.Spikes.ReleaseAll(data)
     if not data or not data.spikes then return end
     for _, spikeData in ipairs(data.spikes) do
+        if spikeData.grabber and TIV.WireAnchor then
+            TIV.WireAnchor.Remove(spikeData.grabber)
+            spikeData.grabber = nil
+        end
         if IsValid(spikeData.entity) then
             constraint.RemoveAll(spikeData.entity)
             spikeData.entity:SetParent(nil)
@@ -253,6 +261,11 @@ function TIV.Spikes.GetState(data)
 
     if phases["deploying"]  and phases["deploying"]  > 0 then return "deploying"  end
     if phases["retracting"] and phases["retracting"] > 0 then return "retracting" end
+    -- "slipping" is a spike being dragged towards the limit of its grip and
+    -- "slipped" one that has lost the ground. Both still mean the set is down,
+    -- so they rank above "deployed" rather than falling through to "none".
+    if phases["slipping"]   and phases["slipping"]   > 0 then return "slipping"   end
+    if phases["slipped"]    and phases["slipped"]    > 0 then return "slipped"    end
     if phases["deployed"]   and phases["deployed"]   > 0 then return "deployed"   end
     if phases["idle"]       and phases["idle"]       > 0 then return "idle"       end
     return "none"
@@ -329,7 +342,61 @@ concommand.Add("tiv_spike_debug", function(ply, cmd, args)
             i, tostring(sd.name or "?"), phase, valid, parented))
     end
 
+    -- Anchor detail: which spikes are still holding the ground, what each is
+    -- carrying, and which hold method the server picked.
+    if TIV.Anchor and TIV.Anchor.ReportLines then
+        for _, line in ipairs(TIV.Anchor.ReportLines(veh, data)) do
+            table.insert(lines, line)
+        end
+    end
+
     for _, line in ipairs(lines) do print(line) end
+end)
+
+-- ============================================================================
+-- ANCHOR DEBUG
+-- ============================================================================
+-- One-shot readout of the anchoring system for a vehicle: hold method,
+-- stressed state, per-spike grip, and the constraint inventory. Deliberately
+-- on-demand rather than periodic so normal gameplay stays quiet; the
+-- continuous version is `tiv_debug_freeze 1`.
+concommand.Add("tiv_anchor_debug", function(ply, cmd, args)
+    if IsValid(ply) and not ply:IsAdmin() then return end
+
+    local veh
+    if args[1] then veh = Entity(tonumber(args[1]) or 0) end
+    if not IsValid(veh) and IsValid(ply) then veh = ply:GetVehicle() end
+    if not IsValid(veh) then
+        print("[TIV] Get in a vehicle or pass an entity index!")
+        return
+    end
+
+    local data = TIV.Deploy.GetState(veh)
+    if not data then
+        print("[TIV] No data")
+        return
+    end
+
+    local counts = TIV.Anchor.GetCounts(data)
+    print("[TIV] === ANCHOR DEBUG ===")
+    print(string.format("Vehicle       : #%d (%s)", veh:EntIndex(), veh:GetClass()))
+    print(string.format("State         : %s   stressed: %s   gravityReleased: %s",
+        tostring(data.state), tostring(data.anchorStressed == true), tostring(data.gravityReleased == true)))
+    print(string.format("Hold method   : %s   (Wiremod %s)",
+        TIV.WireAnchor and TIV.WireAnchor.Describe() or "ballsocket",
+        (TIV.WireAnchor and TIV.WireAnchor.IsAvailable()) and "available" or "not available"))
+    print(string.format("Hold force    : %.0f N   torque %.0f N",
+        TIV.AnchorHoldForce(data.anchorStressed == true),
+        TIV.AnchorHoldTorque(data.anchorStressed == true)))
+    print(string.format("Constraints   : holds=%d (ballsocket %d, grabber %d, world %d) soil=%d airbag=%d nocollide=%d total=%d",
+        counts.holds, counts.ballsockets, counts.grabbers, counts.anchors,
+        counts.embeds, counts.elastics, counts.nocollide, counts.total))
+    if data.plantedPos then
+        print(string.format("Chassis       : risen %.1f u, drifted %.1f u from plant",
+            math.max(0, veh:GetPos().z - data.plantedPos.z),
+            veh:GetPos():Distance(data.plantedPos)))
+    end
+    for _, line in ipairs(TIV.Anchor.ReportLines(veh, data)) do print(line) end
 end)
 
 print("[TIV] Spike system loaded")

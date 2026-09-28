@@ -125,6 +125,23 @@ function TIV.Debug.AuditVehicle(entIndex, data)
         tostring(tracking), TimerNames(entIndex),
         tostring(veh.GStormsIgnore or veh.XT3Ignore or veh.XT2Ignore or false)))
 
+    -- Per-anchor detail while the vehicle is actually on its anchors: which
+    -- spikes are still in the ground, what each one is carrying, which hold
+    -- method is in use, and what force the holds are currently cut at. This is
+    -- the readout that answers "why did that corner lift?".
+    if data.state == "anchored" and TIV.Anchor and TIV.Anchor.ReportLines then
+        for _, line in ipairs(TIV.Anchor.ReportLines(veh, data)) do
+            print("[TIV audit]" .. line)
+        end
+        local rep = data.anchorReport
+        if rep then
+            print(string.format(
+                "[TIV audit]      anchors holding=%d/%d slipped=%d overloaded=%d worst=#%d at %.0f%%",
+                rep.holding, rep.planted, rep.slipped, rep.overloaded,
+                rep.worstIndex, (rep.worst or 0) * 100))
+        end
+    end
+
     -- The combinations that actually leave a vehicle stuck in the air.
     if data.state == "idle" then
         if not phys:IsGravityEnabled() then

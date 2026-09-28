@@ -3,29 +3,48 @@
 -- ============================================================================
 -- Everything that physically ties the chassis to the ground lives here.
 --
---   Plant   : a spike that has reached its drive depth becomes a static body
---             (motion disabled) -- it is now part of the world.
---   Pull-down: elastic constraints from every layout mount to a point below
---             the ground under it are shortened over LowerTime. The chassis is
---             pulled down onto its own suspension by real constraint force;
---             the raycast wheels compress exactly as far as the suspension
---             allows. Independent of how many spikes are fitted.
---   Lock    : limited ballsockets between chassis and planted spikes hold the
---             pulled-down pose (world sockets when no spikes are fitted).
---             Springs at mounts without a spike stay on. Force limit 0 means
---             the loft system is the only thing that ever breaks them.
+--   Plant    : a spike that has reached its drive depth becomes a LIVE physics
+--              body -- motion on, gravity on, colliding with the terrain -- and
+--              is gripped by two soft soil elastics of its own (one vertical,
+--              one lateral). It is never frozen, never welded to the world, and
+--              never a rigid prop: it can be dragged, it can slip, and it can
+--              be torn out.
+--   Hold     : one gimbaled hold per spike ties that spike to the chassis.
+--              Wire Grabber weld when Wiremod is installed, limited ballsocket
+--              when it is not -- whichever is available, chosen automatically.
+--              Because it is a gimbal and not a weld, the spike leans as the
+--              chassis tilts instead of dragging the chassis flat.
+--   Pull-down: elastic constraints from every layout mount to a point below the
+--              ground under it are shortened over LowerTime. The chassis is
+--              pulled down onto its own suspension by real constraint force.
+--
+-- There is no single constraint holding the vehicle down. Six spikes means six
+-- independent anchors, each with its own soil grip, its own hold, its own load
+-- and its own moment of letting go. That is what makes the rear lift while the
+-- front stays planted.
 --
 -- The chassis physics object is never frozen, never teleported and keeps its
--- gravity throughout. Releasing the constraints is what raises the vehicle:
--- the suspension springs back on its own.
+-- gravity throughout. Nothing in here calls SetPos/SetAngles on the vehicle.
 -- ============================================================================
 
 TIV.Anchor = TIV.Anchor or {}
 
-local function GetPivotLimit()
-    return math.Clamp(tonumber(TIV.Config.AnchorPivotLimit) or 28, 5, 60)
-end
+-- Reuses the message cl_instruments already listens for (sound + HUD anchor-fail
+-- marker), so a spike losing the ground is visible to the driver. Declared here
+-- as well as in sv_loft because this file loads first.
+util.AddNetworkString("TIV_AnchorWarning")
 
+-- ============================================================================
+-- CONSTRAINT RECORDS
+-- ============================================================================
+-- Every constraint this system creates is recorded here so it can be found,
+-- re-cut or removed by type. Kinds:
+--   "ballsocket"   chassis<->spike gimbal, or chassis<->world anchor
+--   "grabber"      Wire Grabber weld to the spike (its Weld constraint)
+--   "grabbermount" unbreakable weld holding the grabber body to the chassis
+--   "embed"        soil elastic holding one spike in the ground
+--   "nocollide"    collision pair suppression
+--   "elastic"      airbag pull-down spring
 local function Track(data, con, spikeData, kind, extra)
     data.constraints = data.constraints or {}
     local rec = {
@@ -33,6 +52,9 @@ local function Track(data, con, spikeData, kind, extra)
         spikeIndex      = spikeData and spikeData.index or 0,
         spikeTableIndex = spikeData and spikeData.tableIndex,
         type            = kind,
+        forcelimit      = nil,
+        torquelimit     = nil,
+        stressed        = false,
     }
     if extra then
         for k, v in pairs(extra) do rec[k] = v end
@@ -41,58 +63,258 @@ local function Track(data, con, spikeData, kind, extra)
     return rec
 end
 
+local function Untrack(data, rec)
+    if not data.constraints or not rec then return end
+    for i = #data.constraints, 1, -1 do
+        if data.constraints[i] == rec then
+            table.remove(data.constraints, i)
+            return
+        end
+    end
+end
+
 local function VehicleMass(veh)
     local phys = veh:GetPhysicsObject()
     return IsValid(phys) and math.max(phys:GetMass(), 100) or 800
 end
 
+-- The force/torque limits of a Source constraint are read once, at Spawn, from
+-- the entity's keyvalues -- they are not live Lua fields. The only way to give
+-- an existing hold a new break number is to cut a new one. This does that in a
+-- single frame: the replacement is created first and the old one removed
+-- second, so there is never a physics tick without a hold on the spike.
+--
+-- The anchor point is re-derived from where the two bodies actually are right
+-- now, not from where they were when the original was cut. Re-using the stored
+-- local position would snap the spike back to the chassis the instant the hold
+-- was re-cut -- precisely the kind of teleport this system must not do.
+-- Returns true when the hold was re-cut, false when it could not be, and nil
+-- when it was already cut at that number and was left alone. Callers use the
+-- distinction so "already right" is never counted as a change or as a failure.
+local function RecutHold(veh, data, rec, forceLimit, torqueLimit)
+    if not IsValid(rec.constraint) then return false end
+    -- Already cut at this number: leave it alone. Re-cutting is not free.
+    if rec.forcelimit == forceLimit then return nil end
+
+    local ent2 = rec.ent2 or rec.constraint.Ent2
+    if not ent2 or not IsValid(ent2) then return false end
+
+    if rec.type == "ballsocket" then
+        local limit = math.Clamp(TIV.AnchorSetting("SpikePivotLimit", 22), 2, 60)
+        local localPos
+        if ent2:IsWorld() then
+            localPos = rec.localPos or vector_origin
+        else
+            localPos = veh:WorldToLocal(ent2:GetPos())
+        end
+
+        local replacement = constraint.AdvBallsocket(
+            veh, ent2, 0, 0,
+            localPos, vector_origin,
+            forceLimit, torqueLimit,
+            -limit, -limit, -limit,
+             limit,  limit,  limit,
+            0, 0, 0,
+            1, 0
+        )
+        if not IsValid(replacement) then return false end
+
+        local old = rec.constraint
+        rec.constraint  = replacement
+        rec.localPos    = localPos
+        rec.forcelimit  = forceLimit
+        rec.torquelimit = torqueLimit
+        rec.stressed    = forceLimit > 0
+        old:Remove()
+
+        -- Removing a constraint re-enables collisions between its two bodies,
+        -- and this one carried the nocollide spawnflag. Put the explicit pair
+        -- back in the same frame so the spike cannot start shoving the chassis.
+        if not ent2:IsWorld() and ent2.IsTIVSpike then
+            constraint.NoCollide(veh, ent2, 0, 0)
+        end
+        return true
+    end
+
+    if rec.type == "grabber" then
+        if not (TIV.WireAnchor and TIV.WireAnchor.Regrab(rec.grabber, forceLimit)) then return false end
+        rec.constraint  = rec.grabber.Weld
+        rec.forcelimit  = forceLimit
+        rec.torquelimit = 0
+        rec.stressed    = forceLimit > 0
+        return IsValid(rec.constraint)
+    end
+
+    return false
+end
+
+--- Raises every hold on this vehicle to the stressed force limit.
+-- This is the whole "do not remove the constraints" requirement: the anchors
+-- stay physically attached and keep resisting, they simply stop being
+-- unbreakable. Physics then decides which one loses, and when.
+function TIV.Anchor.StressAll(veh, data)
+    if not IsValid(veh) or not data.constraints then return 0 end
+
+    local force  = TIV.AnchorHoldForce(true)
+    local torque = TIV.AnchorHoldTorque(true)
+    local done, failed, already = 0, 0, 0
+
+    for _, rec in ipairs(data.constraints) do
+        -- The airbag springs and the grabber mounts are not the anchors; they
+        -- are not what the storm is fighting and they stay unbreakable.
+        if rec.type == "ballsocket" or rec.type == "grabber" then
+            if IsValid(rec.constraint) then
+                local r = RecutHold(veh, data, rec, force, torque)
+                if r == true then done = done + 1
+                elseif r == false then failed = failed + 1
+                else already = already + 1 end
+            end
+        end
+    end
+
+    data.anchorStressed = (done + already) > 0
+    if done > 0 then
+        print(string.format("[TIV] #%d anchors re-cut at %.0f N (%d hold(s)%s) -- they now resist but can lose",
+            veh:EntIndex(), force, done, failed > 0 and string.format(", %d failed", failed) or ""))
+    end
+    -- Only the number actually changed, so a second call is a quiet no-op
+    -- rather than churning every constraint again and re-logging.
+    return done
+end
+
+--- Back to the unbreakable hold force (wind dropped off again). World anchors
+-- are skipped: with no spikes in the ground they are the only thing holding the
+-- chassis and they must stay breakable or the vehicle could never be lofted.
+function TIV.Anchor.UnstressAll(veh, data)
+    if not IsValid(veh) or not data.constraints then return 0 end
+    local force  = TIV.AnchorHoldForce(false)
+    local torque = TIV.AnchorHoldTorque(false)
+    local done = 0
+    for _, rec in ipairs(data.constraints) do
+        if (rec.type == "ballsocket" or rec.type == "grabber") and not rec.keepStressed and IsValid(rec.constraint) then
+            if RecutHold(veh, data, rec, force, torque) then done = done + 1 end
+        end
+    end
+    if done > 0 then
+        data.anchorStressed = nil
+        print(string.format("[TIV] #%d wind dropped: %d anchor hold(s) back to the unbreakable limit", veh:EntIndex(), done))
+    end
+    return done
+end
+
+function TIV.Anchor.IsStressed(data)
+    return data ~= nil and data.anchorStressed == true
+end
+
 -- ============================================================================
--- PLANT (spike becomes static, chassis and spike ignore each other)
+-- PLANT (spike becomes a live body gripped by its own soil anchors)
 -- ============================================================================
+local function CreateEmbeds(veh, data, spikeData, spike)
+    local cfg       = TIV.Config.Anchor
+    local ramDir    = spike:GetAngles():Forward()      -- points down into the ground
+    local right     = spike:GetAngles():Right()
+    local spikePos  = spike:GetPos()
+    -- The spike's own origin is the attachment point; for a single-bone prop
+    -- that is always (0,0,0), kept explicit so the intent is readable.
+    local localPos  = spike:WorldToLocal(spikePos)
+
+    -- Two anchor points in the soil: straight below the spike, and offset
+    -- sideways. A pair of springs at different points resists lift AND drag;
+    -- one spring on the ram axis alone would let the spike slide sideways out
+    -- of its hole for free. Both are WORLD positions: when the second body of
+    -- a constraint is the world, its "local" space is world space (that is
+    -- what the pull-down springs above rely on too).
+    local anchorDepth = math.max(2, tonumber(cfg.SoilAnchorDepth or 5) or 5)
+    local embedMain    = spikePos + ramDir * anchorDepth
+    local embedLateral = embedMain + right * (cfg.LateralEmbedOffset or 9)
+    local world        = game.GetWorld()
+
+    local mass     = math.max(spike:GetPhysicsObject():GetMass(), 5)
+    local constant = math.max(200, tonumber(cfg.EmbedConstant or 6000) or 6000)
+    local damping  = math.max(10, tonumber(cfg.EmbedDamping or 400) or 400)
+
+    spikeData.embedConstant = constant
+    spikeData.anchorDepth   = anchorDepth
+
+    local made = 0
+    for _, point in ipairs({ embedMain, embedLateral }) do
+        -- stretchonly: soil grips, it does not push. The spring is exactly at
+        -- its rest length at plant time, so it develops tension only as the
+        -- spike is dragged away from its hole -- and never shoves the spike
+        -- deeper in when the chassis drops onto it.
+        local el = constraint.Elastic(spike, world, 0, 0, localPos, point,
+            constant, damping, 0, "", 0, true)
+        if IsValid(el) then
+            Track(data, el, spikeData, "embed", { embedPos = point })
+            made = made + 1
+        end
+    end
+
+    if made == 0 then
+        print(string.format("[TIV] #%d spike %d: soil anchors failed to create", veh:EntIndex(), spikeData.index))
+    end
+    return made
+end
+
 function TIV.Anchor.PlantSingle(veh, data, spikeData)
     if not IsValid(veh) or not IsValid(spikeData.entity) then return end
     local spike = spikeData.entity
     local pos, ang = spike:GetPos(), spike:GetAngles()
 
-    -- The spike sits below the surface on purpose. It must never be simulated
-    -- as a live body there or the solver ejects it: freeze first, then
-    -- unparent, then hand the (already frozen) physics object its position.
-    local sp = spike:GetPhysicsObject()
-    if IsValid(sp) then
-        sp:EnableMotion(false)
-        sp:EnableGravity(false)
-    end
-    spike:SetCollisionGroup(COLLISION_GROUP_WORLD)
-
+    -- The spike stays exactly where the hydraulic stroke put it: no reposition,
+    -- no snap, and the visual pose the driver just watched is the pose the
+    -- physics now takes over. It is already driven below the surface, so it is
+    -- genuinely in contact with the terrain it is planted in.
     if IsValid(spike:GetParent()) then
         spike:SetParent(nil)
     end
     spike:SetMoveType(MOVETYPE_VPHYSICS)
-    spike:SetPos(pos)
-    spike:SetAngles(ang)
+    spike:SetCollisionGroup(COLLISION_GROUP_NONE)
+
+    local sp = spike:GetPhysicsObject()
     if IsValid(sp) then
         sp:SetPos(pos)
         sp:SetAngles(ang)
         sp:SetVelocity(vector_origin)
         sp:SetAngleVelocity(vector_origin)
-        sp:EnableMotion(false)
+        sp:SetMass(math.max(15, sp:GetMass()))
+        sp:EnableGravity(true)
+        -- Live body. Freezing it here and welding it to the world is exactly
+        -- the "rigid world-locked prop" behaviour this system replaces: a
+        -- frozen spike drags the whole chassis flat instead of letting it tilt.
+        sp:EnableMotion(true)
+        sp:Wake()
     end
 
-    -- Welded to the world: this is what holds it in the ground; the motion
-    -- flag is only a solver shortcut. A weld to a frozen body is not solved,
-    -- so it cannot generate a penetration push either.
-    local groundWeld = constraint.Weld(spike, game.GetWorld(), 0, 0, 0, true, false)
-    if IsValid(groundWeld) then Track(data, groundWeld, spikeData, "groundweld") end
+    -- The spike passes through its own vehicle's hull on the way down; without
+    -- this the two would shove each other on every stroke.
+    if not constraint.Find(veh, spike, "NoCollide", 0, 0) then
+        local nocol = constraint.NoCollide(veh, spike, 0, 0)
+        if IsValid(nocol) then Track(data, nocol, spikeData, "nocollide") end
+    end
+    -- And it must never become a club for whoever is standing next to it.
+    for _, ply in ipairs(player.GetAll()) do
+        if not constraint.Find(spike, ply, "NoCollide", 0, 0) then
+            constraint.NoCollide(spike, ply, 0, 0)
+        end
+    end
 
-    local nocol = constraint.NoCollide(veh, spike, 0, 0)
-    if IsValid(nocol) then Track(data, nocol, spikeData, "nocollide") end
+    spikeData.plantedPos  = pos
+    spikeData.plantedAng  = ang
+    spikeData.ramDir      = ang:Forward()
+    spikeData.plantedAt   = CurTime()
+    spikeData.slipped     = nil
+    spikeData.slipNoticed = nil
+    spikeData.pullDist    = 0
+    spikeData.slipDist    = 0
+    spikeData.load        = 0
+    spikeData.phase       = "deployed"
 
-    spikeData.plantedPos = pos
-    spikeData.phase = "deployed"
+    CreateEmbeds(veh, data, spikeData, spike)
 end
 
 -- ============================================================================
--- PULL-DOWN (elastics chassis -> ground)
+-- PULL-DOWN (airbag elastics chassis -> ground)
 -- ============================================================================
 -- The springs run from the chassis mounts to points on the world found by
 -- tracing straight down, so lowering does not depend on spikes existing.
@@ -112,10 +334,7 @@ end
 -- The airbag mounts are ALL the spike mounts of the vehicle's layout
 -- (TIV.Config.SpikeOffsets), whatever number of spikes is actually fitted:
 -- the airbags lower the whole vehicle, the spikes only decide where it is
--- pinned afterwards. Using only the fitted spikes' mounts made a two-spike
--- vehicle kneel on its nose. An earlier no-spike fallback used the
--- render-bounds corners near the wheel bottoms, where the ground trace could
--- start inside a slope and the lopsided pull threw the vehicle around.
+-- pinned afterwards.
 local function MountPoints(veh, data)
     local mounts = {}
     local offsets = TIV.SpikeAnim and TIV.SpikeAnim.GetOffsetsForVehicle and TIV.SpikeAnim.GetOffsetsForVehicle(veh)
@@ -141,12 +360,7 @@ local function MountPoints(veh, data)
 end
 TIV.Anchor.MountPoints = MountPoints
 
--- Ground surface at a mount's x/y. The spike mounts sit at the chassis
--- origin, i.e. at ground level on a jeep at ride height and BELOW the
--- surface once the vehicle has been pulled down, so the trace starts well
--- above the mount and the surface may legitimately be above it. The vehicle
--- and everything it carries are excluded by the filter, so whatever the
--- trace hits is ground.
+-- Ground surface at a mount's x/y.
 local TRACE_LIFT = 48
 local function GroundUnder(mountWorld, filter)
     local tr = util.TraceLine({
@@ -159,17 +373,11 @@ local function GroundUnder(mountWorld, filter)
     return tr.HitPos
 end
 
--- Returns the number of springs created. `lowerAmount` is how far the chassis
--- should end up below its current height; the suspension is the real limit,
--- the spring only supplies the pull. lowerAmount 0 just holds the current pose.
 local RemoveByType
 
 function TIV.Anchor.StartPullDown(veh, data, lowerAmount)
     if not IsValid(veh) then return 0 end
-    -- Springs kept through the anchored state (mounts with no spike) would
-    -- otherwise hold the old length against the new set.
     RemoveByType(data, "elastic")
-    -- game.GetWorld() is never IsValid(); constraint.* accepts it directly.
     local world = game.GetWorld()
     if not world then return 0 end
     lowerAmount = lowerAmount or 0
@@ -179,16 +387,8 @@ function TIV.Anchor.StartPullDown(veh, data, lowerAmount)
     local mass = VehicleMass(veh)
     local overshoot = 12
 
-    -- The spring's ground end sits below the surface by the full stroke plus
-    -- a margin. A spring is only ever shortened by lowerAmount + overshoot,
-    -- so its length can never be asked to go below the margin no matter how
-    -- close the mount is to the ground; with the end on the surface itself a
-    -- mount at ground level (the spike mounts sit at the chassis origin) left
-    -- nothing to shorten and the vehicle barely moved.
     local anchorDepth = lowerAmount + overshoot + 8
 
-    -- Find the ground first so the per-spring force is shared between the
-    -- springs that actually exist, not the mounts that were asked for.
     local anchors = {}
     for _, mountLocal in ipairs(mounts) do
         local mountWorld = veh:LocalToWorld(mountLocal)
@@ -205,15 +405,7 @@ function TIV.Anchor.StartPullDown(veh, data, lowerAmount)
     if n < #mounts then
         print(string.format("[TIV] #%d pull-down: ground under %d of %d mounts", veh:EntIndex(), n, #mounts))
     end
-    if GetConVar("tiv_debug_freeze") and GetConVar("tiv_debug_freeze"):GetBool() then
-        for i, a in ipairs(anchors) do
-            print(string.format("[TIV] #%d spring %d: mount (%.0f %.0f %.0f) rest %.1f u, will shorten by %.1f u",
-                veh:EntIndex(), i, a.localPos.x, a.localPos.y, a.localPos.z, a.restLength, lowerAmount + overshoot))
-        end
-    end
 
-    -- At full shortening the springs pull with roughly 8x the vehicle weight,
-    -- spread across the springs.
     local constant = (mass * 600 * 8) / (n * (lowerAmount + overshoot))
     local damping  = (mass * 40) / n
 
@@ -229,7 +421,6 @@ function TIV.Anchor.StartPullDown(veh, data, lowerAmount)
     return #data.pullDown.elastics
 end
 
--- frac 0..1 of the lowering stroke; drives the spring lengths.
 function TIV.Anchor.UpdatePullDown(data, frac)
     local pd = data.pullDown
     if not pd then return end
@@ -242,8 +433,6 @@ function TIV.Anchor.UpdatePullDown(data, frac)
     end
 end
 
--- frac 0..1 of the raise stroke; the stretch-only springs act as a ceiling
--- that is let out gradually, so the suspension rebounds at hydraulic speed.
 function TIV.Anchor.UpdateRaise(data, frac, riseAmount)
     local pd = data.pullDown
     if not pd then return end
@@ -266,17 +455,27 @@ RemoveByType = function(data, wanted)
     end
 end
 
--- Drops the springs only; used once the ballsockets hold the pose.
 function TIV.Anchor.ReleaseSprings(veh, data)
     RemoveByType(data, "elastic")
     data.pullDown = nil
 end
 
--- Once the spikes are locked, the springs at mounts a planted spike now
--- holds are dropped; the springs at mounts WITHOUT a spike stay and keep
--- that part of the vehicle down (the airbag under it is still inflated),
--- so a partial spike set still holds the whole vehicle lowered. They go
--- with everything else on retract or when the hold is broken.
+-- Drops the soil anchors of one spike only. This is what "a spike loses ground
+-- contact" physically is: its own two springs let go and nothing else about the
+-- vehicle changes.
+function TIV.Anchor.ReleaseEmbeds(veh, data, spikeIndex)
+    local removed = 0
+    for i = #(data.constraints or {}), 1, -1 do
+        local c = data.constraints[i]
+        if c.type == "embed" and c.spikeIndex == spikeIndex then
+            if IsValid(c.constraint) then c.constraint:Remove() end
+            table.remove(data.constraints, i)
+            removed = removed + 1
+        end
+    end
+    return removed
+end
+
 local COVER_RADIUS = 24
 function TIV.Anchor.ReleaseCoveredSprings(veh, data)
     if not IsValid(veh) then return end
@@ -288,7 +487,6 @@ function TIV.Anchor.ReleaseCoveredSprings(veh, data)
     end
     if #planted == 0 then return end
 
-    local kept = {}
     for i = #(data.constraints or {}), 1, -1 do
         local c = data.constraints[i]
         if c.type == "elastic" then
@@ -304,8 +502,6 @@ function TIV.Anchor.ReleaseCoveredSprings(veh, data)
             if covered or not IsValid(c.constraint) then
                 if IsValid(c.constraint) then c.constraint:Remove() end
                 table.remove(data.constraints, i)
-            else
-                kept[#kept + 1] = c
             end
         end
     end
@@ -320,97 +516,165 @@ function TIV.Anchor.ReleaseCoveredSprings(veh, data)
     end
 end
 
--- Drops the ballsockets only; the springs (if any) keep the body down.
+-- Drops the holds only; the springs (if any) keep the body down.
 function TIV.Anchor.ReleaseLock(veh, data)
     RemoveByType(data, "ballsocket")
+    RemoveByType(data, "grabber")
+    RemoveByType(data, "embed")
+    data.anchorStressed = nil
 end
 
 -- ============================================================================
--- LOCK (limited ballsocket chassis <-> spike at the settled pose)
+-- HOLD (one gimbaled anchor per spike: Wire Grabber, or ballsocket)
 -- ============================================================================
-function TIV.Anchor.AttachSingle(veh, data, spikeData, spikeTableIndex)
-    if not IsValid(veh) or not IsValid(spikeData.entity) then return end
-    spikeData.tableIndex = spikeTableIndex or spikeData.tableIndex
-
+local function AttachWithGrabber(veh, data, spikeData, spikeTableIndex)
     local spike = spikeData.entity
-    local sp = spike:GetPhysicsObject()
-    if IsValid(sp) and sp:IsMotionEnabled() then
-        sp:SetVelocity(vector_origin)
-        sp:SetAngleVelocity(vector_origin)
-        sp:EnableMotion(false)
+    local grabber, mount, nocollide = TIV.WireAnchor.CreateGrabber(veh, data, spikeData)
+    if not IsValid(grabber) then return false end
+
+    local force = TIV.AnchorHoldForce(data.anchorStressed == true)
+    if not TIV.WireAnchor.Grab(grabber, force) then
+        print(string.format("[TIV] #%d grabber %d failed to grab its spike, falling back to a ballsocket",
+            veh:EntIndex(), spikeData.index))
+        TIV.WireAnchor.Remove(grabber)
+        if IsValid(mount) then mount:Remove() end
+        if IsValid(nocollide) then nocollide:Remove() end
+        return false
     end
 
-    local limit = GetPivotLimit()
+    spikeData.tableIndex = spikeTableIndex or spikeData.tableIndex
+    if IsValid(mount) then
+        Track(data, mount, spikeData, "grabbermount", { grabber = grabber, forcelimit = 0 })
+    end
+    if IsValid(nocollide) then
+        Track(data, nocollide, spikeData, "nocollide")
+    end
+    Track(data, grabber.Weld, spikeData, "grabber", {
+        ent2        = spike,
+        grabber     = grabber,
+        forcelimit  = force,
+        torquelimit = 0,
+        stressed    = force > 0,
+    })
+    spikeData.grabber = grabber
+    return true
+end
+
+local function AttachWithBallsocket(veh, data, spikeData, spikeTableIndex)
+    local spike = spikeData.entity
+    local sp = spike:GetPhysicsObject()
+
+    -- Zero the spike's motion at the instant the hold is cut so the gimbal is
+    -- captured at rest rather than mid-swing.
+    if IsValid(sp) then
+        sp:SetVelocity(vector_origin)
+        sp:SetAngleVelocity(vector_origin)
+    end
+
+    local limit = math.Clamp(TIV.AnchorSetting("SpikePivotLimit", 22), 2, 60)
+    local force = TIV.AnchorHoldForce(data.anchorStressed == true)
+    local torque = TIV.AnchorHoldTorque(data.anchorStressed == true)
     local localAttachPos = veh:WorldToLocal(spike:GetPos())
+
     local bs = constraint.AdvBallsocket(
         veh, spike, 0, 0,
         localAttachPos, vector_origin,
-        TIV.Config.BallSocketForceLimit or 0, 0,
+        force, torque,
         -limit, -limit, -limit,
          limit,  limit,  limit,
         0, 0, 0,
-        0, 0, 0,
-        1
+        1, 0
     )
-    if IsValid(bs) then
-        Track(data, bs, spikeData, "ballsocket", { localPos = localAttachPos })
-    else
+    if not IsValid(bs) then
         print("[TIV] WARNING: Ballsocket failed for spike " .. tostring(spikeData.index))
+        return false
     end
 
-    local hasNoCollide = false
-    for _, c in ipairs(data.constraints or {}) do
-        if c.type == "nocollide" and c.spikeIndex == spikeData.index and IsValid(c.constraint) then
-            hasNoCollide = true
-            break
-        end
-    end
-    if not hasNoCollide then
+    spikeData.tableIndex = spikeTableIndex or spikeData.tableIndex
+    Track(data, bs, spikeData, "ballsocket", {
+        ent2        = spike,
+        localPos    = localAttachPos,
+        localPos2   = vector_origin,
+        forcelimit  = force,
+        torquelimit = torque,
+        stressed    = force > 0,
+    })
+
+    if not constraint.Find(veh, spike, "NoCollide", 0, 0) then
         local nocol = constraint.NoCollide(veh, spike, 0, 0)
         if IsValid(nocol) then Track(data, nocol, spikeData, "nocollide") end
     end
+    return true
 end
+
+function TIV.Anchor.AttachSingle(veh, data, spikeData, spikeTableIndex)
+    if not IsValid(veh) or not IsValid(spikeData.entity) then return end
+
+    -- Whichever anchoring method is available, automatically. Wiremod present
+    -- and grabbers enabled: the spike hold is a Wire Grabber weld. Otherwise
+    -- (or if the grab refused) the ballsocket hold does exactly the same job.
+    if TIV.WireAnchor and TIV.WireAnchor.IsAvailable() then
+        if AttachWithGrabber(veh, data, spikeData, spikeTableIndex) then return end
+    end
+    AttachWithBallsocket(veh, data, spikeData, spikeTableIndex)
+end
+
+local function HasHold(data, spikeIndex)
+    for _, c in ipairs(data.constraints or {}) do
+        if c.spikeIndex == spikeIndex and (c.type == "ballsocket" or c.type == "grabber") and IsValid(c.constraint) then
+            return true
+        end
+    end
+    return false
+end
+TIV.Anchor.HasHold = HasHold
 
 function TIV.Anchor.AttachAll(veh, data)
     if not IsValid(veh) then return end
     for i, sd in ipairs(data.spikes or {}) do
         if sd.phase == "deployed" and IsValid(sd.entity) then
-            local has = false
-            for _, c in ipairs(data.constraints or {}) do
-                if c.type == "ballsocket" and c.spikeIndex == sd.index and IsValid(c.constraint) then
-                    has = true
-                    break
-                end
+            if not HasHold(data, sd.index) then
+                TIV.Anchor.AttachSingle(veh, data, sd, i)
             end
-            if not has then TIV.Anchor.AttachSingle(veh, data, sd, i) end
         end
     end
 end
 
 -- 0-spike mode: hold the chassis to the world directly. One socket per mount
--- point (the same corners the springs pulled on), so the pose is fixed by
--- geometry exactly as it is by four planted spikes. A single centre socket
--- left the chassis free to rotate into its angular limits, and the compressed
--- suspension pushing against those limits is what shook the vehicle.
+-- point (the same corners the springs pulled on). With no spikes there are no
+-- soil anchors to lose, so these are cut at the stressed limit straight away:
+-- a chassis with nothing in the ground has to be able to be lifted.
 function TIV.Anchor.AttachWorld(veh, data)
     if not IsValid(veh) then return end
     local world = game.GetWorld()
     if not world then return end
-    local limit = GetPivotLimit()
+    local limit = math.Clamp(TIV.AnchorSetting("SpikePivotLimit", 22), 2, 60)
+    local force = TIV.AnchorHoldForce(true)
+    local torque = TIV.AnchorHoldTorque(true)
     local created = 0
     for _, mountLocal in ipairs(MountPoints(veh, data)) do
         local bs = constraint.AdvBallsocket(
             veh, world, 0, 0,
             mountLocal, veh:LocalToWorld(mountLocal),
-            TIV.Config.BallSocketForceLimit or 0, 0,
+            force, torque,
             -limit, -limit, -limit,
              limit,  limit,  limit,
             0, 0, 0,
-            0, 0, 0,
-            1
+            1, 0
         )
         if IsValid(bs) then
-            Track(data, bs, nil, "ballsocket", { isWorldAnchor = true, localPos = mountLocal })
+            Track(data, bs, nil, "ballsocket", {
+                isWorldAnchor = true,
+                ent2          = world,
+                localPos      = mountLocal,
+                localPos2     = veh:LocalToWorld(mountLocal),
+                forcelimit    = force,
+                torquelimit   = torque,
+                stressed      = force > 0,
+                -- With no spikes in the ground these are the only anchors, and
+                -- they must stay breakable for the vehicle to ever be lofted.
+                keepStressed  = true,
+            })
             created = created + 1
         end
     end
@@ -435,14 +699,187 @@ end
 TIV.Anchor.EnsureLive = TIV.Anchor.UnfreezeForDeploy
 
 -- ============================================================================
+-- PER-SPIKE GROUND CONTACT
+-- ============================================================================
+-- Each spike carries its own measurement of how hard the ground is holding it.
+-- pullDist is how far it has been dragged out along its own ram axis, slipDist
+-- how far sideways, load a 0..1 estimate of the force in its soil springs
+-- against the current break number. All three come from where the spike
+-- actually is -- nothing is scripted.
+function TIV.Anchor.UpdateSpikeLoad(veh, data, sd)
+    if not sd or not IsValid(sd.entity) then return end
+    if sd.phase ~= "deployed" or not sd.plantedPos then
+        sd.pullDist, sd.slipDist, sd.load = 0, 0, 0
+        return
+    end
+
+    local ramDir = sd.ramDir or veh:GetAngles():Forward()
+    local delta  = sd.entity:GetPos() - sd.plantedPos
+    -- ramDir points DOWN into the ground, so a spike dragged UP out of its hole
+    -- moves against it: the pull is the component along -ramDir.
+    local along  = delta:Dot(ramDir)
+    local lateral = delta - ramDir * along
+
+    sd.pullDist = math.max(0, -along)
+    sd.slipDist = lateral:Length()
+
+    local pullOut = math.max(1, tonumber(TIV.AnchorSetting("PullOutDistance", 11)) or 11)
+    local slipOut = math.max(1, tonumber(TIV.AnchorSetting("SlipOutDistance", 15)) or 15)
+    local force   = (sd.embedConstant or 6000) * math.max(sd.pullDist, sd.slipDist)
+    local limit   = TIV.AnchorHoldForce(data.anchorStressed == true)
+
+    sd.load = math.Clamp(math.max(sd.pullDist / pullOut, sd.slipDist / slipOut), 0, 1)
+    sd.anchorForce = force
+    sd.overLimit   = limit > 0 and force > limit
+
+    -- A spike that has been dragged past what its hole can grip has lost the
+    -- ground. Only its own soil springs go; the hold to the chassis stays, so
+    -- the piston comes out of the earth and rides with the vehicle while the
+    -- spikes that still have grip keep their end of the vehicle down.
+    --
+    -- Two guards keep a legitimate plant from reading as a tear-out: the body
+    -- has to have settled first (a spike that has just been driven in is still
+    -- absorbing the impact), and while nothing is stressing the anchors the
+    -- hole gets more slack -- a calm vehicle does not lose its spikes just
+    -- because the solver nudged one a couple of units.
+    local settle = math.max(0, tonumber(TIV.AnchorSetting("SettleTime", 0.75)) or 0)
+    if sd.plantedAt and CurTime() - sd.plantedAt < settle then return end
+
+    local slack = 1
+    if not data.anchorStressed then
+        slack = math.max(1, tonumber(TIV.AnchorSetting("CalmSlack", 2.5)) or 1)
+    end
+
+    if sd.pullDist >= pullOut * slack or sd.slipDist >= slipOut * slack then
+        -- The godmode cheat promises the spikes never break. The load is still
+        -- measured and reported, so the readouts stay honest; only the letting
+        -- go is suppressed.
+        local godmode = GetConVar("tiv_cheat_godmode_anchors")
+        if not (godmode and godmode:GetBool()) then
+            TIV.Anchor.TearOutSpike(veh, data, sd)
+            return
+        end
+    end
+    if not sd.slipNoticed and sd.load >= (tonumber(TIV.AnchorSetting("OverloadFraction", 0.7)) or 0.7) then
+        sd.slipNoticed = true
+        sd.phase = "slipping"
+        if data.spikeAnims then data.spikeAnims[sd.index] = "slipping" end
+        if IsValid(sd.entity) then
+            sd.entity:EmitSound("physics/metal/metal_box_strain" .. math.random(1, 4) .. ".wav", 62, math.random(55, 75))
+        end
+    end
+end
+
+function TIV.Anchor.TearOutSpike(veh, data, sd)
+    if not sd or sd.slipped then return end
+    sd.slipped    = true
+    sd.failed     = true
+    sd.load       = 1
+    sd.phase      = "slipped"
+    if data and data.spikeAnims then data.spikeAnims[sd.index] = "slipped" end
+
+    TIV.Anchor.ReleaseEmbeds(veh, data, sd.index)
+
+    local spike = sd.entity
+    if IsValid(spike) then
+        local spark = EffectData()
+        spark:SetOrigin(spike:GetPos())
+        spark:SetMagnitude(6)
+        spark:SetScale(2.5)
+        util.Effect("Sparks", spark)
+        spike:EmitSound("physics/concrete/gravel_impact_bullet" .. math.random(1, 4) .. ".wav", 78, math.random(70, 90))
+    end
+
+    if IsValid(veh) then
+        util.ScreenShake(veh:GetPos(), 2.5, 12, 0.3, 260)
+        net.Start("TIV_AnchorWarning")
+            net.WriteEntity(veh)
+            net.WriteUInt(sd.index or 0, 8)
+        net.Broadcast()
+        hook.Run("TIV_SpikeFailure", veh, sd.index)
+    end
+
+    print(string.format("[TIV] #%d spike %d lost ground contact (pull %.1f u, slip %.1f u) -- %d anchor(s) still holding",
+        IsValid(veh) and veh:EntIndex() or 0, sd.index or 0,
+        sd.pullDist or 0, sd.slipDist or 0, TIV.Anchor.LiveAnchorCount(data)))
+end
+
+--- Measures every planted spike and returns the anchor tally the loft system
+-- drives itself from.
+function TIV.Anchor.UpdateAnchors(veh, data)
+    local report = { planted = 0, holding = 0, slipped = 0, worst = 0, worstIndex = 0, overloaded = 0 }
+    if not IsValid(veh) or not data then return report end
+
+    for _, sd in ipairs(data.spikes or {}) do
+        if IsValid(sd.entity) and (sd.phase == "deployed" or sd.phase == "slipping") then
+            TIV.Anchor.UpdateSpikeLoad(veh, data, sd)
+            report.planted = report.planted + 1
+            if sd.slipped then
+                report.slipped = report.slipped + 1
+            else
+                report.holding = report.holding + 1
+                if (sd.load or 0) > report.worst then
+                    report.worst = sd.load
+                    report.worstIndex = sd.index
+                end
+                if (sd.load or 0) >= (tonumber(TIV.AnchorSetting("OverloadFraction", 0.7)) or 0.7) then
+                    report.overloaded = report.overloaded + 1
+                end
+            end
+        end
+    end
+    data.anchorReport = report
+    return report
+end
+
+function TIV.Anchor.LiveAnchorCount(data)
+    local n = 0
+    for _, c in ipairs((data and data.constraints) or {}) do
+        if (c.type == "ballsocket" or c.type == "grabber" or c.type == "embed") and IsValid(c.constraint) then
+            n = n + 1
+        end
+    end
+    return n
+end
+
+--- Counts only the constraints that actually reach the GROUND: a spike's soil
+-- elastics, or a chassis<->world anchor.
+--
+-- This is the number that decides whether the vehicle is still tied down, and
+-- it is deliberately NOT the same as LiveAnchorCount. A chassis<->spike hold
+-- whose spike has been dragged out of the earth is still a perfectly healthy
+-- constraint -- it is just holding the vehicle to a loose piece of metal. Once
+-- every spike has lost the ground, those holds are dead weight and the vehicle
+-- is free, however many constraints are still on the list.
+function TIV.Anchor.LiveGroundAnchorCount(data)
+    local n = 0
+    for _, c in ipairs((data and data.constraints) or {}) do
+        if IsValid(c.constraint) and (c.type == "embed" or (c.type == "ballsocket" and c.isWorldAnchor)) then
+            n = n + 1
+        end
+    end
+    return n
+end
+
+-- ============================================================================
 -- DETACH
 -- ============================================================================
 function TIV.Anchor.DetachAll(veh, data)
     for _, c in ipairs(data.constraints or {}) do
         if IsValid(c.constraint) then c.constraint:Remove() end
     end
-    data.constraints = {}
-    data.pullDown = nil
+    data.constraints  = {}
+    data.pullDown     = nil
+    data.anchorStressed = nil
+
+    -- The grabber bodies belong to this anchoring set and go with it.
+    for _, sd in ipairs(data.spikes or {}) do
+        if sd.grabber then
+            TIV.WireAnchor.Remove(sd.grabber)
+            sd.grabber = nil
+        end
+    end
+
     if IsValid(veh) then
         TIV.Anchor.UnfreezeForDeploy(veh)
     end
@@ -453,8 +890,8 @@ function TIV.Anchor.ForceDetach(veh, data)
     data.anchored = false
 end
 
--- Removes only the hold-down constraints (ballsockets + elastics) so the
--- suspension springs back; nocollides stay until the spikes retract.
+-- Removes only the hold-down constraints (holds + soil + airbag springs) so
+-- the suspension springs back; nocollides stay until the spikes retract.
 function TIV.Anchor.ReleaseHold(veh, data)
     TIV.Anchor.ReleaseLock(veh, data)
     TIV.Anchor.ReleaseSprings(veh, data)
@@ -472,11 +909,19 @@ function TIV.Anchor.BreakSpike(veh, data, spikeIndex)
             broke = true
         end
     end
+    if broke and TIV.WireAnchor then
+        for _, sd in ipairs(data.spikes or {}) do
+            if sd.index == spikeIndex and sd.grabber then
+                TIV.WireAnchor.Remove(sd.grabber)
+                sd.grabber = nil
+            end
+        end
+    end
     return broke
 end
 
--- Drops every constraint record for one spike (ground weld, nocollide, and
--- any hold) so it can stroke back into its cylinder cleanly.
+-- Drops every constraint record for one spike (hold, soil anchors, nocollide)
+-- and the grabber body, so it can stroke back into its cylinder cleanly.
 function TIV.Anchor.UnplantSingle(veh, data, spikeIndex)
     for i = #(data.constraints or {}), 1, -1 do
         local c = data.constraints[i]
@@ -485,38 +930,103 @@ function TIV.Anchor.UnplantSingle(veh, data, spikeIndex)
             table.remove(data.constraints, i)
         end
     end
+    if TIV.WireAnchor then
+        for _, sd in ipairs(data.spikes or {}) do
+            if sd.index == spikeIndex and sd.grabber then
+                TIV.WireAnchor.Remove(sd.grabber)
+                sd.grabber = nil
+            end
+        end
+    end
+    for _, sd in ipairs(data.spikes or {}) do
+        if sd.index == spikeIndex then
+            sd.slipped     = nil
+            sd.slipNoticed = nil
+            sd.plantedPos  = nil
+            sd.pullDist    = 0
+            sd.slipDist    = 0
+            sd.load        = 0
+        end
+    end
 end
 
 -- ============================================================================
 -- QUERIES
 -- ============================================================================
+-- "Intact" means the vehicle is still tied to the GROUND, so this counts soil
+-- anchors and world anchors rather than every hold: a hold on a spike that has
+-- come out of the earth is intact as a constraint and useless as an anchor.
 function TIV.Anchor.CheckIntegrity(veh, data)
     if not data.constraints then return true end
-    local ballsockets = 0
+    local ground = 0
     for i = #data.constraints, 1, -1 do
         local c = data.constraints[i]
         if not IsValid(c.constraint) then
             table.remove(data.constraints, i)
-        elseif c.type == "ballsocket" then
-            ballsockets = ballsockets + 1
+        elseif c.type == "embed" or (c.type == "ballsocket" and c.isWorldAnchor) then
+            ground = ground + 1
         end
     end
-    return ballsockets > 0
+    return ground > 0
 end
 
+-- counts.ballsockets is the "how many anchors are down" number the wire
+-- controller and the HUD already read, so grabber holds are counted there too.
 function TIV.Anchor.GetCounts(data)
-    local counts = { total = 0, ballsockets = 0, anchors = 0, nocollide = 0, elastics = 0 }
+    local counts = {
+        total = 0, ballsockets = 0, anchors = 0, nocollide = 0, elastics = 0,
+        grabbers = 0, embeds = 0, holds = 0,
+    }
     for _, c in ipairs(data.constraints or {}) do
         if IsValid(c.constraint) then
             counts.total = counts.total + 1
             if c.type == "ballsocket" then
-                if c.isWorldAnchor then counts.anchors = counts.anchors + 1 else counts.ballsockets = counts.ballsockets + 1 end
+                if c.isWorldAnchor then
+                    counts.anchors = counts.anchors + 1
+                else
+                    counts.ballsockets = counts.ballsockets + 1
+                end
+                counts.holds = counts.holds + 1
+            elseif c.type == "grabber" then
+                counts.grabbers = counts.grabbers + 1
+                counts.ballsockets = counts.ballsockets + 1
+                counts.holds = counts.holds + 1
+            elseif c.type == "embed" then counts.embeds = counts.embeds + 1
             elseif c.type == "nocollide" then counts.nocollide = counts.nocollide + 1
             elseif c.type == "elastic" then counts.elastics = counts.elastics + 1
             end
         end
     end
     return counts
+end
+
+--- One line per spike, for the audit and tiv_spike_debug.
+function TIV.Anchor.ReportLines(veh, data)
+    local lines = {}
+    if not data then return lines end
+    local counts = TIV.Anchor.GetCounts(data)
+    lines[#lines + 1] = string.format(
+        "  Anchors: mode=%s stressed=%s holds=%d (ballsocket %d / grabber %d / world %d) soil=%d force=%.0f N",
+        TIV.WireAnchor and TIV.WireAnchor.Describe() or "ballsocket",
+        tostring(data.anchorStressed == true), counts.holds, counts.ballsockets,
+        counts.grabbers, counts.anchors, counts.embeds,
+        TIV.AnchorHoldForce(data.anchorStressed == true))
+
+    for _, sd in ipairs(data.spikes or {}) do
+        if IsValid(sd.entity) then
+            local hold = HasHold(data, sd.index) and "hold" or "NO-HOLD"
+            local soil = 0
+            for _, c in ipairs(data.constraints or {}) do
+                if c.type == "embed" and c.spikeIndex == sd.index and IsValid(c.constraint) then soil = soil + 1 end
+            end
+            lines[#lines + 1] = string.format(
+                "  Spike #%-2d %-12s %-9s [%s] soil=%d pull=%5.1fu slip=%5.1fu load=%3.0f%%%s",
+                sd.index or 0, tostring(sd.name or "?"), tostring(sd.phase), hold, soil,
+                sd.pullDist or 0, sd.slipDist or 0, (sd.load or 0) * 100,
+                sd.overLimit and "  OVERLOADED" or "")
+        end
+    end
+    return lines
 end
 
 print("[TIV] Anchor system loaded")

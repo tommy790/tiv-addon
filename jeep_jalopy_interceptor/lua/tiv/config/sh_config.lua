@@ -400,3 +400,10 @@ TIV.Config.WireControllerOffsets = {
     },
 }
 
+-- ============================================================================
+-- ANCHOR / LOFT TUNING
+-- Every force, distance and stiffness the anchoring mechanics use, in one
+-- place. Loaded last so it can read nothing but itself.
+-- ============================================================================
+include("tiv/config/sh_anchor_config.lua")
+

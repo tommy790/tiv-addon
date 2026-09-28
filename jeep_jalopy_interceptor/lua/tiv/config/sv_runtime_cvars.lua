@@ -82,6 +82,28 @@ local function applyRuntimeLoftConfig()
     TIV.Config.LoftWindThreshold = threshold
 end
 
+-- Anchor tuning. Writes straight into TIV.Config.Anchor, which is the only
+-- place the anchor/loft mechanics read their numbers from, so a convar change
+-- takes effect on the next deploy (and on the next hold re-cut) without
+-- touching any of the mechanics.
+local function applyRuntimeAnchorConfig()
+    local A = TIV.Config.Anchor
+    if not A then return end
+
+    A.StressedForceLimit = math.Clamp(
+        GetConVar("tiv_anchor_stress_force"):GetFloat(), 1000, 1000000)
+    A.StressedTorqueLimit = A.StressedForceLimit
+    A.PullOutDistance = math.Clamp(GetConVar("tiv_anchor_pullout"):GetFloat(), 2, 60)
+    A.EmbedConstant   = math.Clamp(GetConVar("tiv_anchor_soil_constant"):GetFloat(), 200, 200000)
+    A.UseGrabbers     = GetConVar("tiv_anchor_use_grabbers"):GetBool() and 1 or 0
+
+    -- The availability cache keys off UseGrabbers, so flipping the convar has
+    -- to be allowed to change the answer.
+    if TIV.WireAnchor and TIV.WireAnchor.InvalidateCache then
+        TIV.WireAnchor.InvalidateCache()
+    end
+end
+
 CreateConVar(
     "tiv_spike_count",
     tostring(TIV.Config.SpikeCount),
@@ -157,6 +179,40 @@ CreateConVar(
     "Wind MPH threshold where anchored spikes fail and loft begins.",
     TIV.Config.LoftWindMin,
     TIV.Config.WindMaxSimulated or 350
+)
+
+CreateConVar(
+    "tiv_anchor_stress_force",
+    tostring(TIV.Config.Anchor and TIV.Config.Anchor.StressedForceLimit or 50000),
+    { FCVAR_ARCHIVE, FCVAR_NOTIFY, FCVAR_REPLICATED },
+    "Force limit (N) the spike holds are re-cut at once the loft sequence is failing. They keep resisting, but can now lose.",
+    1000,
+    1000000
+)
+
+CreateConVar(
+    "tiv_anchor_pullout",
+    tostring(TIV.Config.Anchor and TIV.Config.Anchor.PullOutDistance or 11),
+    { FCVAR_ARCHIVE, FCVAR_NOTIFY, FCVAR_REPLICATED },
+    "How far (units) a spike must be dragged out of the ground before it loses its grip and lets go.",
+    2,
+    60
+)
+
+CreateConVar(
+    "tiv_anchor_soil_constant",
+    tostring(TIV.Config.Anchor and TIV.Config.Anchor.EmbedConstant or 6000),
+    { FCVAR_ARCHIVE, FCVAR_NOTIFY, FCVAR_REPLICATED },
+    "Soil grip stiffness (N per unit of stretch) for each spike's ground anchors.",
+    200,
+    200000
+)
+
+CreateConVar(
+    "tiv_anchor_use_grabbers",
+    "1",
+    { FCVAR_ARCHIVE, FCVAR_NOTIFY, FCVAR_REPLICATED },
+    "Use Wire Grabbers for spike anchoring when Wiremod is installed (0 = always use ball sockets)."
 )
 
 CreateConVar(
@@ -305,6 +361,25 @@ cvars.AddChangeCallback("tiv_loft_wind_threshold", function(_, _, _)
     applyRuntimeLoftConfig()
 end, "TIV_RuntimeLoftThreshold")
 
+cvars.AddChangeCallback("tiv_anchor_stress_force", function(_, _, new)
+    applyRuntimeAnchorConfig()
+    print(string.format("[TIV] Anchor stress force: %s N (next hold re-cut)", tostring(new)))
+end, "TIV_RuntimeAnchorStressForce")
+
+cvars.AddChangeCallback("tiv_anchor_pullout", function(_, _, _)
+    applyRuntimeAnchorConfig()
+end, "TIV_RuntimeAnchorPullout")
+
+cvars.AddChangeCallback("tiv_anchor_soil_constant", function(_, _, _)
+    applyRuntimeAnchorConfig()
+end, "TIV_RuntimeAnchorSoilConstant")
+
+cvars.AddChangeCallback("tiv_anchor_use_grabbers", function(_, _, new)
+    applyRuntimeAnchorConfig()
+    print(string.format("[TIV] Spike anchoring: %s (next deploy)",
+        tobool(new) and "Wire Grabbers when available" or "ball sockets"))
+end, "TIV_RuntimeAnchorUseGrabbers")
+
 cvars.AddChangeCallback("tiv_wire_hide_controller", function(_, _, new)
     local hide = tobool(new)
     if TIV.Wire and TIV.Wire.UpdateControllerVisibility then
@@ -319,6 +394,7 @@ hook.Add("Initialize", "TIV_ApplyRuntimeCvars", function()
     applyRuntimeSpikeVisibility()
     applyRuntimeCompatConfig()
     applyRuntimeLoftConfig()
+    applyRuntimeAnchorConfig()
 end)
 
 print("[TIV] Runtime convars loaded")
