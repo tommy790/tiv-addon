@@ -84,9 +84,19 @@ TIV.Config.Anchor = {
     -- whole vehicle bobs on its spikes.
     EmbedDamping = 1500,
 
-    -- How far below the spike's own origin the soil anchor points sit. Also the
-    -- rest length of the two springs, so this is how much slack the spike has
-    -- before the ground starts pushing back.
+    -- How much buried shaft the soil actually grips, in units. The two soil
+    -- springs attach at either end of this span, measured along the spike from
+    -- its origin, and the gap between them is their lever arm: it is what lets
+    -- the ground resist the spike TWISTING rather than only being pulled out.
+    -- Set it to 0 and both springs collapse onto the ballsocket pivot, where
+    -- they have no lever arm at all and the spike rotates freely in its hole.
+    -- Keep it comfortably below SpikeDriveDepth so both grips stay buried.
+    SoilGripLength = 14,
+
+    -- How far down the shaft the upper soil grip sits, measured from the
+    -- spike's origin. Keeps both grips clear of the ballsocket pivot (where
+    -- they would have no lever arm) and buried even at the shallowest
+    -- SpikeDriveDepth. The lower grip is SoilGripLength further down.
     SoilAnchorDepth = 5,
 
     -- A spike that is pulled this far out of its hole has lost the ground and

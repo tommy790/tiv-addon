@@ -226,41 +226,62 @@ end
 -- ============================================================================
 local function CreateEmbeds(veh, data, spikeData, spike)
     local cfg       = TIV.Config.Anchor
-    local ramDir    = spike:GetAngles():Forward()      -- points down into the ground
-    local right     = spike:GetAngles():Right()
+    local ang       = spike:GetAngles()
+    local ramDir    = ang:Forward()      -- world; points down the shaft into the ground
+    local right     = ang:Right()
     local spikePos  = spike:GetPos()
-    -- The spike's own origin is the attachment point; for a single-bone prop
-    -- that is always (0,0,0), kept explicit so the intent is readable.
-    local localPos  = spike:WorldToLocal(spikePos)
 
-    -- Two anchor points in the soil: straight below the spike, and offset
-    -- sideways. A pair of springs at different points resists lift AND drag;
-    -- one spring on the ram axis alone would let the spike slide sideways out
-    -- of its hole for free. Both are WORLD positions: when the second body of
-    -- a constraint is the world, its "local" space is world space (that is
-    -- what the pull-down springs above rely on too).
-    local anchorDepth = math.max(2, tonumber(cfg.SoilAnchorDepth or 5) or 5)
-    local embedMain    = spikePos + ramDir * anchorDepth
-    local embedLateral = embedMain + right * (cfg.LateralEmbedOffset or 9)
-    local world        = game.GetWorld()
+    -- The soil grips a LENGTH of buried shaft, not a single point, and that is
+    -- not a nicety -- it is the whole reason the anchors hold.
+    --
+    -- A force applied exactly at a ball-and-socket pivot has no lever arm about
+    -- that pivot, so it cannot produce any moment. Both springs used to attach
+    -- at the spike's origin, which is the very point the chassis hold pins, so
+    -- however stiff the soil was it could never resist the spike ROTATING: it
+    -- only ever loaded the hold. The spike was then free to twist and lean in
+    -- its hole with nothing to bring it back, which is what "bent and rotated"
+    -- was.
+    --
+    -- Spread along the shaft instead, the two springs act at different radii
+    -- from the pivot and so produce a real restoring moment.
+    --
+    -- Spike-local +X is the entity's Forward, i.e. straight down the shaft.
+    -- Both grips sit BELOW the origin so they stay buried even at the shallowest
+    -- drive depth, and clear of the pivot.
+    local grip = math.max(2, tonumber(cfg.SoilGripLength or 14) or 14)
+    local top  = math.max(1, tonumber(cfg.SoilAnchorDepth or 5) or 5)
 
-    local mass     = math.max(spike:GetPhysicsObject():GetMass(), 5)
+    -- The anchors sit either side of the shaft, so each spring has the lateral
+    -- offset as its rest length: the small amount of slack before the ground
+    -- starts pushing back, and the sideways grip that stops the spike sliding
+    -- out of its hole. These are WORLD positions -- when the second body of a
+    -- constraint is the world, its "local" space is world space (the pull-down
+    -- springs above rely on that too).
+    local lateral = cfg.LateralEmbedOffset or 9
+
+    local grips = {
+        { localPos = Vector(top,         0, 0), point = spikePos + ramDir *  top         - right * lateral },
+        { localPos = Vector(top + grip,  0, 0), point = spikePos + ramDir * (top + grip) + right * lateral },
+    }
+    local world = game.GetWorld()
+
     local constant = math.max(200, tonumber(cfg.EmbedConstant or 6000) or 6000)
     local damping  = math.max(10, tonumber(cfg.EmbedDamping or 400) or 400)
 
     spikeData.embedConstant = constant
-    spikeData.anchorDepth   = anchorDepth
+    spikeData.anchorDepth   = top
+    spikeData.gripLength    = grip
 
     local made = 0
-    for _, point in ipairs({ embedMain, embedLateral }) do
-        -- stretchonly: soil grips, it does not push. The spring is exactly at
+    for _, g in ipairs(grips) do
+        -- stretchonly: soil grips, it does not push. Each spring is exactly at
         -- its rest length at plant time, so it develops tension only as the
-        -- spike is dragged away from its hole -- and never shoves the spike
-        -- deeper in when the chassis drops onto it.
-        local el = constraint.Elastic(spike, world, 0, 0, localPos, point,
+        -- spike is dragged or twisted away from its hole -- and never shoves
+        -- the spike deeper in when the chassis drops onto it.
+        local el = constraint.Elastic(spike, world, 0, 0, g.localPos, g.point,
             constant, damping, 0, "", 0, true)
         if IsValid(el) then
-            Track(data, el, spikeData, "embed", { embedPos = point })
+            Track(data, el, spikeData, "embed", { embedPos = g.point })
             made = made + 1
         end
     end
