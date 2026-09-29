@@ -11,8 +11,11 @@
 --   Heavy wind : immunity drops, the storm is allowed to act on the chassis and
 --                the whole vehicle starts rocking on its anchors.
 --   Failing    : past the loft threshold the holds are re-cut at
---                StressedForceLimit. They are NOT removed -- they keep
---                resisting, they just stop being infinite.
+--                StressedForceLimit AND the storm starts pushing on the
+--                chassis. The holds are NOT removed -- they keep resisting,
+--                they just stop being infinite. The load is a real force
+--                applied to the physics object, sized from the anchors' own
+--                rating, so the threshold is a threshold and not a HUD readout.
 --   Partial    : the most loaded spike is dragged past its pull-out distance,
 --                its own soil springs let go, and that end of the vehicle
 --                rises while the others stay planted. The chassis rotates
@@ -106,6 +109,92 @@ local function GetLoftThreshold(veh)
         or TIV.Config.LoftWindThreshold or 180
 end
 
+-- ============================================================================
+-- STORM LOAD
+-- ============================================================================
+-- The force the wind actually applies. See the STORM LOAD block in
+-- sh_anchor_config.lua for why it is derived from the anchors rather than from
+-- the wind speed alone: put shortly, without this the threshold was a number on
+-- a HUD. The sampled speed re-cut the holds at a finite force limit and nothing
+-- ever produced enough force to reach it, so a TIV survived any wind at all.
+local function LoadSetting(key, fallback)
+    local v = tonumber(TIV.AnchorSetting(key, fallback))
+    if v == nil then v = fallback end
+    return v
+end
+
+-- Captured once, the moment the holds are re-cut, then held for the whole
+-- event. Tracking the live holds instead would make every spike that tore out
+-- reduce the storm's own force, and the vehicle would settle into surviving on
+-- whatever was left: the failure would arrest itself.
+function TIV.Loft.CaptureStormLoad(veh, data)
+    if not data then return 0 end
+    local ref = tonumber(data.stormLoadRef) or 0
+    if ref <= 0 then
+        ref = (TIV.Anchor.TotalHoldForce and TIV.Anchor.TotalHoldForce(data)) or 0
+        data.stormLoadRef = math.max(0, tonumber(ref) or 0)
+    end
+    return data.stormLoadRef
+end
+
+-- Applies the storm load for this tick and returns it. Continuous force, so it
+-- has to be applied every tick; nothing here repositions or freezes anything.
+function TIV.Loft.ApplyStormLoad(veh, data, windMPH)
+    if not IsValid(veh) or not data then return 0 end
+    if not tobool(TIV.AnchorSetting("WindLoadEnabled", 1)) then return 0 end
+
+    local ref = tonumber(data.stormLoadRef) or 0
+    if ref <= 0 then return 0 end
+
+    local mph = tonumber(windMPH) or 0
+    local threshold = math.max(1, tonumber(GetLoftThreshold(veh)) or 180)
+
+    -- Below the threshold the anchors are meant to hold solid, and the vehicle
+    -- is deliberately left alone: at or past it, the storm gets its hands on it.
+    if mph < threshold then
+        data.stormLoad = 0
+        return 0
+    end
+
+    local phys = veh:GetPhysicsObject()
+    if not IsValid(phys) then return 0 end
+
+    -- Drag, not bookkeeping: the load grows with the square of the overshoot.
+    local ratio   = mph / threshold
+    local exp     = math.max(1, LoadSetting("WindLoadExponent", 2))
+    local maxMult = math.max(1, LoadSetting("WindLoadMaxMult", 4))
+    local mult    = math.min(ratio ^ exp, maxMult)
+
+    local fraction = math.max(0, LoadSetting("WindLoadAtThreshold", 0.7))
+    local scale    = math.max(0, LoadSetting("WindLoadScale", 1))
+    local lift     = math.max(0, LoadSetting("WindLoadLift", 0.4))
+
+    local load = ref * fraction * mult * scale
+    if load <= 0 then
+        data.stormLoad = 0
+        return 0
+    end
+
+    local force = TIV.Wind.GetDirection(veh) * load
+    force.z = force.z + load * lift
+
+    -- Applied above the centre of mass, so the same load rolls and pitches the
+    -- vehicle instead of only sliding it along the ground. At the centre there
+    -- would be no moment at all.
+    local aero = LoadSetting("WindLoadAeroHeight", 25)
+    local base = veh:GetPos()
+    if veh.WorldSpaceCenter then
+        local ok, ws = pcall(veh.WorldSpaceCenter, veh)
+        if ok and ws then base = ws end
+    end
+    local point = base + Vector(0, 0, aero)
+
+    phys:ApplyForceOffset(force, point)
+
+    data.stormLoad = load
+    return load
+end
+
 local function CleanupLoftTracking(entIdx)
     TIV.Loft.WindTimers[entIdx]    = nil
     TIV.Loft.FailingGroups[entIdx] = nil
@@ -113,6 +202,12 @@ local function CleanupLoftTracking(entIdx)
     if data then
         if data.state == "anchored" then data.gravityReleased = false end
         data.holdStressed = nil
+        -- The storm load belongs to an anchored vehicle that is losing. It is
+        -- dropped here so that a stand-down, a retract or a loft all end it --
+        -- nothing keeps pushing on a vehicle that is no longer fighting its
+        -- anchors, and a re-deploy captures a fresh reference.
+        data.stormLoadRef = nil
+        data.stormLoad    = 0
     end
     for wave = 1, 3 do
         timer.Remove("TIV_WaveFail_" .. entIdx .. "_" .. wave)
@@ -490,6 +585,16 @@ local function ProcessAnchored(entIndex, veh, data)
             data.gravityReleased = true
 
             local stressed = TIV.Anchor.StressAll(veh, data)
+
+            -- The holds have just been re-cut to a finite rating, so this is
+            -- the one moment where "what the storm is fighting" is a real
+            -- number: the summed force limit of every hold that is still live.
+            -- Which is exactly why it is captured HERE and then frozen. Read
+            -- live instead, it would shrink with every spike the storm tore
+            -- out, the wind would get weaker as the vehicle got weaker, and it
+            -- would end up surviving on its last two spikes.
+            TIV.Loft.CaptureStormLoad(veh, data)
+
             if stressed == 0 and TIV.Spikes.GetCount(data) == 0 then
                 -- No spikes and no world anchors to stress: nothing is holding
                 -- it, so it is simply loose.
@@ -514,6 +619,24 @@ local function ProcessAnchored(entIndex, veh, data)
         end
     else
         data.calmDuration = 0
+    end
+
+    -- ------------------------------------------------------------------
+    -- STORM LOAD
+    -- The threshold is not just a label on the HUD: past it the wind actually
+    -- pushes on the chassis, at the reference captured above and growing with
+    -- the square of the overshoot. Below it the load is zero and the anchors
+    -- are solid, which is what they are for.
+    --
+    -- This is a force and nothing else. It does not move the vehicle, does not
+    -- freeze it and does not decide anything -- the solver decides what that
+    -- force does to the chassis, the holds and the soil, exactly as it would
+    -- for wind coming from a storm mod.
+    -- ------------------------------------------------------------------
+    if data.holdStressed then
+        TIV.Loft.ApplyStormLoad(veh, data, windMPH)
+    elseif (data.stormLoad or 0) ~= 0 then
+        data.stormLoad = 0
     end
 
     -- ------------------------------------------------------------------

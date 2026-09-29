@@ -921,13 +921,59 @@ end
 -- every spike has lost the ground, those holds are dead weight and the vehicle
 -- is free, however many constraints are still on the list.
 function TIV.Anchor.LiveGroundAnchorCount(data)
+    if not data then return 0 end
     local n = 0
-    for _, c in ipairs((data and data.constraints) or {}) do
-        if IsValid(c.constraint) and (c.type == "embed" or (c.type == "ballsocket" and c.isWorldAnchor)) then
-            n = n + 1
+    for _, c in ipairs(data.constraints or {}) do
+        if IsValid(c.constraint) then
+            if c.type == "ballsocket" and c.isWorldAnchor then
+                n = n + 1
+            elseif c.type == "embed" then
+                -- A soil grip only anchors THIS vehicle while the spike carrying
+                -- it is still held by the chassis. Once the hold has let go the
+                -- spike is a spike standing in the ground next to the vehicle,
+                -- not an anchor, and counting it would keep the loft failsafe
+                -- quiet while the vehicle was already free -- which is exactly
+                -- how a TIV ends up riding out wind its anchors were never
+                -- rated for.
+                if (c.spikeIndex or 0) > 0 and HasHold(data, c.spikeIndex) then
+                    n = n + 1
+                end
+            end
         end
     end
     return n
+end
+
+-- The force the storm has to beat to separate the vehicle from its own anchors:
+-- the summed force limit of every live chassis hold, at whatever rating those
+-- holds are currently cut at. The filter deliberately mirrors StressAll's, so
+-- this number is exactly what the wind is fighting and nothing else.
+--
+-- The soil springs are NOT part of it. constraint.Elastic takes no force limit
+-- at all -- a spike's grip on the ground is measured in distance travelled
+-- (PullOutDistance), not in force -- so folding EmbedConstant in here would
+-- invent a resistance that does not exist.
+--
+-- Returns the total and the hold count, because the debug report wants both.
+function TIV.Anchor.TotalHoldForce(data)
+    if not data or not data.constraints then return 0, 0 end
+
+    local force = TIV.AnchorHoldForce(data.anchorStressed == true)
+    if force <= 0 then
+        -- Unstressed holds are unbreakable, so at any wind speed they are not
+        -- the thing that gives. Report the stressed rating rather than 0, so
+        -- that a caller asking "what would this take" gets a real answer
+        -- instead of a division by zero.
+        force = TIV.AnchorHoldForce(true)
+    end
+
+    local n = 0
+    for _, c in ipairs(data.constraints) do
+        if (c.type == "ballsocket" or c.type == "grabber") and IsValid(c.constraint) then
+            n = n + 1
+        end
+    end
+    return force * n, n
 end
 
 -- ============================================================================

@@ -68,6 +68,72 @@ TIV.Config.Anchor = {
     KeepAirbagsWhileAnchored = true,
 
     -- ========================================================================
+    -- STORM LOAD (the force the wind actually puts on a vehicle that is losing)
+    -- ========================================================================
+    -- Until now the wind was only ever a MEASUREMENT. The addon sampled the
+    -- speed, showed it on the HUD and re-cut the holds at StressedForceLimit --
+    -- but nothing applied a force to the chassis at all. The only thing that
+    -- pushed a deployed vehicle was an external storm mod, and while it was
+    -- solidly anchored those mods were told to ignore it. The result: a TIV
+    -- sitting under a 250 MPH sample its own anchors were rated for 200 was
+    -- never loaded beyond about a tenth of its own weight, so the holds never
+    -- reached their limit, nothing tore out, and it survived indefinitely.
+    -- The threshold was a number on a HUD, not a force.
+    --
+    -- So the load is derived from the anchors themselves: at the loft threshold
+    -- the wind is worth WindLoadAtThreshold of everything the live holds can
+    -- take combined, and past that it scales with the square of the speed --
+    -- drag, not bookkeeping. Below 1.0 the windward spikes let go first and the
+    -- rest keep holding, which is the asymmetric, progressive loss the spike
+    -- system exists to produce. At 1.0 and above the anchors are beaten as a
+    -- group.
+    --
+    -- The shape that gives, at the 0.7 default:
+    --   at the threshold  x1.00 -> 0.70x the rating: holds solid, storm starts
+    --                              loading the windward corners
+    --   threshold x1.10   x1.21 -> 0.85x: in trouble, still anchored
+    --   threshold x1.195  x1.43 -> 1.00x: the group limit -- every hold is at
+    --                              or past its own rating, loss is certain
+    --   threshold x1.25   x1.56 -> 1.09x: a 200 MPH-rated vehicle under 250 MPH
+    --
+    -- So a threshold is where the fight STARTS, not where it ends, and the
+    -- anchors are beaten as a group at 1/sqrt(WindLoadAtThreshold) of it.
+    --
+    -- If you run with a real storm mod that pushes vehicles itself, set
+    -- tiv_anchor_wind_load 0 and let it do the pushing -- this load is for the
+    -- case where nothing else is.
+    --
+    -- The reference load is FROZEN when the holds are stressed. If it tracked
+    -- the live holds instead, every spike that tore out would make the storm
+    -- weaker, and the vehicle would settle into surviving on whatever was left
+    -- -- the exact "it should not still be here" behaviour this replaces.
+    WindLoadEnabled = 1,
+
+    -- Wind load at the threshold, as a fraction of the live holds' total force
+    -- limit. 1.0 = the anchors are exactly matched at the threshold and a
+    -- vehicle cannot survive any overshoot at all. Lower it for a longer, more
+    -- progressive fight; raise it to have the anchors start giving right at the
+    -- threshold.
+    WindLoadAtThreshold = 0.7,
+
+    -- Load scales as (mph / threshold) ^ this. 2 is real drag.
+    WindLoadExponent = 2,
+
+    -- Ceiling on that scale, so an extreme sample cannot turn into an absurd
+    -- force. At 4, a 200 MPH threshold is fully gone by 400 MPH and stays there.
+    WindLoadMaxMult = 4,
+
+    -- Fraction of the load applied upward. A horizontal push cannot lift a
+    -- vehicle off the ground however hard it blows; the vertical component is
+    -- what the anchors actually have to beat, and what rocks the nose up.
+    WindLoadLift = 0.4,
+
+    -- How far above the chassis centre the load acts, in units. Applying it at
+    -- the centre would only translate; above it, the same force also rolls and
+    -- pitches the vehicle, which is what a real interception looks like.
+    WindLoadAeroHeight = 25,
+
+    -- ========================================================================
     -- GROUND EMBED (per-spike soil grip)
     -- ========================================================================
     -- Soil stiffness, in N per unit the spike has been dragged out of its hole.

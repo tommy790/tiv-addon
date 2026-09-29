@@ -388,6 +388,17 @@ concommand.Add("tiv_anchor_debug", function(ply, cmd, args)
     print(string.format("Hold force    : %.0f N   torque %.0f N",
         TIV.AnchorHoldForce(data.anchorStressed == true),
         TIV.AnchorHoldTorque(data.anchorStressed == true)))
+
+    -- The load side of the same equation. "Hold force" alone cannot tell you
+    -- whether a vehicle is actually in trouble; the ratio can.
+    local total, holds = TIV.Anchor.TotalHoldForce(data)
+    local load = tonumber(data.stormLoad) or 0
+    local ref  = tonumber(data.stormLoadRef) or 0
+    print(string.format("Storm load    : %.0f N applied (%.0f N at threshold x %.2f from %.0f N rated over %d hold(s))",
+        load,
+        ref * math.max(0, tonumber(TIV.AnchorSetting("WindLoadAtThreshold", 0.7)) or 0.7),
+        ref > 0 and (load / math.max(1, ref)) or 0,
+        total, holds))
     print(string.format("Constraints   : holds=%d (ballsocket %d, grabber %d, world %d) soil=%d airbag=%d nocollide=%d total=%d",
         counts.holds, counts.ballsockets, counts.grabbers, counts.anchors,
         counts.embeds, counts.elastics, counts.nocollide, counts.total))

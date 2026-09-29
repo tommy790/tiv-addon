@@ -53,7 +53,7 @@ WIND_MPH = 0
 TIV.Wind = TIV.Wind or {}
 TIV.Wind.GetSpeed = function() return WIND_MPH or 0 end
 TIV.Wind.GetForceVector = function() return Vector(0, WIND_MPH or 0, 0) end
-TIV.Wind.GetDirection = function() return Angle(0, 0, 0) end
+TIV.Wind.GetDirection = function() return Vector(1, 0, 0) end
 if not TIV.Spikes then
     TIV.Spikes = {
         GetState = function() return "anchored" end,
@@ -614,6 +614,114 @@ run(L6, 'S13 robustness', `
   TIV.Config.Ground.Enabled = 0
   check(TIV.Ground.Pierce(makeProp(800, 800, 60), {}) == nil, "Enabled=0 makes Pierce refuse")
   TIV.Config.Ground.Enabled = 1
+`);
+
+// ------------------------------------------------------------ storm load
+const L7 = bootLua(false); wire(L7);
+run(L7, 'S14 storm load', `
+  section("S14: past the threshold the wind is a FORCE, not a number on a HUD")
+  check(TIV.Loft.ApplyStormLoad ~= nil, "ApplyStormLoad exists")
+  check(TIV.Loft.CaptureStormLoad ~= nil, "CaptureStormLoad exists")
+  check(TIV.Anchor.TotalHoldForce ~= nil, "TotalHoldForce exists")
+
+  local veh = makeVehicle()
+  local data = { state = "anchored", constraints = {}, spikes = {}, spikeAnims = {} }
+  local spikes = makeSpikes(veh, data)
+  for i, sd in ipairs(spikes) do TIV.Anchor.PlantSingle(veh, data, sd) end
+  TIV.Anchor.AttachAll(veh, data)
+  TIV.Deploy.Vehicles[veh:EntIndex()] = data
+  local think = timer.__timers["TIV_LoftThink"]
+
+  -- The user's exact numbers: rated at 200, blowing 250.
+  TIV.Config.LoftWindThreshold = 200
+
+  -- Below the threshold the anchors must hold, and must be left alone.
+  WIND_MPH = 180
+  for i = 1, 10 do CURTIME = CURTIME + 0.05; think.fn() end
+  check(data.holdStressed ~= true, "below the threshold the holds stay unstressed")
+  check((data.stormLoad or 0) == 0, "no load below the threshold (got " .. tostring(data.stormLoad) .. ")")
+  check(TIV.Anchor.LiveGroundAnchorCount(data) > 0, "still anchored at 180 against a 200 rating")
+
+  -- Crossing it: the holds are re-cut AND the wind starts pushing.
+  WIND_MPH = 220
+  CURTIME = CURTIME + 0.05; think.fn()
+  check(data.holdStressed == true, "crossing the threshold stresses the holds")
+  local rated = TIV.Anchor.TotalHoldForce(data)
+  check(data.stormLoadRef == rated and rated > 0,
+      "reference captured from the live holds (" .. tostring(data.stormLoadRef) .. " vs " .. tostring(rated) .. ")")
+  check(data.stormLoad > 0, "wind load applied past the threshold")
+  -- The curve: the load is WindLoadAtThreshold (default 0.7) of the holds'
+  -- rating AT the threshold and grows with the square of the overshoot, so the
+  -- anchors are beaten as a group at 1/sqrt(0.7) = 1.2x it. Just over the
+  -- threshold the vehicle is in trouble; a bit further up it is gone.
+  check(data.stormLoad < rated,
+      "at 1.1x the threshold the vehicle is in trouble but not lost (" ..
+      string.format("%.0f", data.stormLoad) .. " of " .. string.format("%.0f", rated) .. " N)");
+
+  -- The actual force must have reached the physics object.
+  local phys = veh:GetPhysicsObject()
+  local applied = (phys.__forces or {})[#(phys.__forces or {})]
+  check(applied ~= nil, "a force was applied to the vehicle's physics object")
+  check(applied and applied.force.x > 0, "the load pushes downwind")
+  check(applied and applied.force.z > 0, "the load has an upward component")
+  check(applied and applied.point ~= nil and applied.point.z > veh:GetPos().z,
+      "the load acts above the centre of mass, so it can roll the vehicle")
+  check(#(phys.__torques or {}) == 0, "no torque is scripted -- the offset produces the moment")
+
+  check(math.abs(data.stormLoad / rated - 0.7 * (220 / 200) ^ 2) < 0.001,
+      "the load is exactly WindLoadAtThreshold x overshoot squared")
+
+  -- The crossover: 1/sqrt(0.7) = 1.195x, so at 240 (1.2x) the holds are beaten
+  -- as a group and every one of them is past its own limit.
+  WIND_MPH = 240
+  CURTIME = CURTIME + 0.05; think.fn()
+  check(data.stormLoad > rated,
+      "at 1.2x the threshold the load passes the whole group's rating (" ..
+      string.format("%.0f", data.stormLoad) .. " of " .. string.format("%.0f", rated) .. " N)")
+
+  -- THE BUG: at 250 against a 200 rating the wind must beat the anchors.
+  WIND_MPH = 250
+  CURTIME = CURTIME + 0.05; think.fn()
+  check(data.stormLoad > rated,
+      "at 250 against a 200 rating the load exceeds every live hold's limit (" ..
+      string.format("%.0f", data.stormLoad) .. " vs " .. string.format("%.0f", rated) ..
+      " N) -- the vehicle cannot hold")
+
+  -- Drag, not bookkeeping: the load grows with the square of the overshoot.
+  local at250 = data.stormLoad
+  WIND_MPH = 300
+  CURTIME = CURTIME + 0.05; think.fn()
+  local ratio = (data.stormLoad / at250) / ((300 / 250) ^ 2)
+  check(math.abs(ratio - 1) < 0.01, "load scales with the square of the speed (got " .. string.format("%.3f", ratio) .. ")")
+
+  -- The reference is frozen, so losing spikes does not calm the storm down.
+  local before        = data.stormLoadRef
+  local anchorsBefore = TIV.Anchor.LiveGroundAnchorCount(data)
+  for i = 1, 3 do
+      TIV.Anchor.TearOutSpike(veh, data, data.spikes[i])
+  end
+  local anchorsAfter = TIV.Anchor.LiveGroundAnchorCount(data)
+  check(anchorsAfter < anchorsBefore,
+      "half the spikes torn out cost the vehicle ground anchors (" ..
+      anchorsBefore .. " -> " .. anchorsAfter .. ")")
+
+  WIND_MPH = 250
+  CURTIME = CURTIME + 0.05; think.fn()
+  check(data.stormLoadRef == before, "the storm's reference did not shrink with the vehicle")
+  check(math.abs(data.stormLoad - at250) < 1,
+      "the storm is exactly as strong against a weaker vehicle (" ..
+      string.format("%.0f", data.stormLoad) .. " N, was " .. string.format("%.0f", at250) .. " N)")
+
+  -- A vehicle whose chassis holds have all let go is not anchored by the soil
+  -- grips still on the spikes standing in the ground beside it.
+  for _, sd in ipairs(data.spikes) do TIV.Anchor.ReleaseLock(veh, data, sd.index) end
+  check(TIV.Anchor.LiveGroundAnchorCount(data) == 0,
+      "soil grips alone do not count as being anchored to THIS vehicle (got " ..
+      TIV.Anchor.LiveGroundAnchorCount(data) .. ")")
+  CURTIME = CURTIME + 0.05; think.fn()
+  check(data.state == "lofted", "loses the fight once nothing holds it (state=" .. tostring(data.state) .. ")")
+  check(veh:GetPhysicsObject():IsMotionEnabled() == true, "still a live physics body after lofting")
+  check((data.stormLoad or 0) == 0, "the storm load stops once the vehicle is free")
 `);
 
 console.log(`\n>>> ${pass} checks, ${fail} failures`);

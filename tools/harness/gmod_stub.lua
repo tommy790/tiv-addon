@@ -167,6 +167,11 @@ function ENT_MT:GetRight() return self.__ang:Right() end
 function ENT_MT:DeleteOnRemove() end
 function ENT_MT:SetBeamLength(l) self.__beam = l end
 function ENT_MT:GetBeamLength() return self.__beam or 100 end
+function ENT_MT:WorldSpaceCenter()
+    local mn, mx = self:OBBMins(), self:OBBMaxs()
+    if not mn or not mx then return self.__pos end
+    return self:LocalToWorld((mn + mx) * 0.5)
+end
 function ENT_MT:LocalToWorld(v)
     local a = self.__ang
     return self.__pos + a:Forward() * v.x + a:Right() * v.y + a:Up() * v.z
@@ -201,9 +206,18 @@ function PHYS_MT:SetAngleVelocity(v) self.__ent.__angvel = v end
 function PHYS_MT:GetAngleVelocity() return self.__ent.__angvel end
 function PHYS_MT:SetPos(p) self.__ent.__pos = p end
 function PHYS_MT:SetAngles(a) self.__ent.__ang = a end
-function PHYS_MT:ApplyForceCenter() end
-function PHYS_MT:ApplyForceOffset() end
-function PHYS_MT:ApplyTorqueCenter() end
+function PHYS_MT:ApplyForceCenter(f)
+    self.__forces = self.__forces or {}
+    self.__forces[#self.__forces + 1] = { force = f, point = nil }
+end
+function PHYS_MT:ApplyForceOffset(f, p)
+    self.__forces = self.__forces or {}
+    self.__forces[#self.__forces + 1] = { force = f, point = p }
+end
+function PHYS_MT:ApplyTorqueCenter(t)
+    self.__torques = self.__torques or {}
+    self.__torques[#self.__torques + 1] = t
+end
 function PHYS_MT:LocalToWorld(v) return self.__ent:LocalToWorld(v) end
 function PHYS_MT:WorldToLocal(v) return self.__ent:WorldToLocal(v) end
 

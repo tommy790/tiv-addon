@@ -97,6 +97,12 @@ local function applyRuntimeAnchorConfig()
     A.EmbedConstant   = math.Clamp(GetConVar("tiv_anchor_soil_constant"):GetFloat(), 200, 200000)
     A.UseGrabbers     = GetConVar("tiv_anchor_use_grabbers"):GetBool() and 1 or 0
 
+    -- Storm load. The scale is a straight multiplier on the whole load, which
+    -- is the one knob worth having live: it is what decides whether the
+    -- threshold is a wall or a suggestion.
+    A.WindLoadScale = math.Clamp(GetConVar("tiv_anchor_wind_load"):GetFloat(), 0, 4)
+    A.WindLoadLift  = math.Clamp(GetConVar("tiv_anchor_wind_lift"):GetFloat(), 0, 1.5)
+
     -- The availability cache keys off UseGrabbers, so flipping the convar has
     -- to be allowed to change the answer.
     if TIV.WireAnchor and TIV.WireAnchor.InvalidateCache then
@@ -188,6 +194,24 @@ CreateConVar(
     "Force limit (N) the spike holds are re-cut at once the loft sequence is failing. They keep resisting, but can now lose.",
     1000,
     1000000
+)
+
+CreateConVar(
+    "tiv_anchor_wind_load",
+    "1",
+    { FCVAR_ARCHIVE, FCVAR_NOTIFY, FCVAR_REPLICATED },
+    "Multiplier on the storm load a failing TIV feels. At 1 the wind matches 70% of the anchors' total force limit at the loft threshold and grows with the square of the speed past it; 0 returns to external storm mods only.",
+    0,
+    4
+)
+
+CreateConVar(
+    "tiv_anchor_wind_lift",
+    tostring(TIV.Config.Anchor and TIV.Config.Anchor.WindLoadLift or 0.4),
+    { FCVAR_ARCHIVE, FCVAR_NOTIFY, FCVAR_REPLICATED },
+    "Fraction of the storm load applied upward. This is the component the anchors actually have to beat to keep the vehicle on the ground.",
+    0,
+    1.5
 )
 
 CreateConVar(
