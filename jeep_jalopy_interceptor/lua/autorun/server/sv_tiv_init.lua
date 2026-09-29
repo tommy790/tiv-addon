@@ -20,6 +20,14 @@ include("tiv/progression/sv_progression.lua")
 include("tiv/customization/sv_custom_components.lua")
 
 include("tiv/wind/sv_wind.lua")
+
+-- Ground pierce: standalone prop-into-terrain system. Loaded before the anchor
+-- module because the interceptor's spikes take their soil grip geometry from
+-- it (see TIV.Config.Ground.UseForSpikes).
+include("tiv/ground/sh_ground_config.lua")
+AddCSLuaFile("tiv/ground/sh_ground_config.lua")
+include("tiv/ground/sv_ground_pierce.lua")
+
 include("tiv/animation/sv_spike_anim.lua")
 include("tiv/spikes/sv_spikes.lua")
 include("tiv/anchor/sv_wire_anchor.lua")

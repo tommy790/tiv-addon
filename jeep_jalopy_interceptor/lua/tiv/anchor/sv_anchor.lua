@@ -242,35 +242,54 @@ local function CreateEmbeds(veh, data, spikeData, spike)
     -- its hole with nothing to bring it back, which is what "bent and rotated"
     -- was.
     --
-    -- Spread along the shaft instead, the two springs act at different radii
-    -- from the pivot and so produce a real restoring moment.
+    -- Spread along the shaft instead, the grips act at different radii from
+    -- the pivot and so produce a real restoring moment.
     --
-    -- Spike-local +X is the entity's Forward, i.e. straight down the shaft.
-    -- Both grips sit BELOW the origin so they stay buried even at the shallowest
-    -- drive depth, and clear of the pivot.
-    local grip = math.max(2, tonumber(cfg.SoilGripLength or 14) or 14)
-    local top  = math.max(1, tonumber(cfg.SoilAnchorDepth or 5) or 5)
-
-    -- The anchors sit either side of the shaft, so each spring has the lateral
-    -- offset as its rest length: the small amount of slack before the ground
-    -- starts pushing back, and the sideways grip that stops the spike sliding
-    -- out of its hole. These are WORLD positions -- when the second body of a
-    -- constraint is the world, its "local" space is world space (the pull-down
-    -- springs above rely on that too).
+    -- Every grip sits BELOW the origin, so the set stays buried even at the
+    -- shallowest drive depth and stays clear of the pivot.
     local lateral = cfg.LateralEmbedOffset or 9
 
-    local grips = {
-        { localPos = Vector(top,         0, 0), point = spikePos + ramDir *  top         - right * lateral },
-        { localPos = Vector(top + grip,  0, 0), point = spikePos + ramDir * (top + grip) + right * lateral },
-    }
+    -- Grip geometry comes from the ground pierce system when it is loaded, so
+    -- the interceptor's spikes and any other pierced prop share one definition
+    -- of "how the soil holds a shaft" and can never drift apart. Everything
+    -- downstream of this stays exactly as it was: the springs are tracked in
+    -- data.constraints, and the load measurement and tear-out in
+    -- UpdateSpikeLoad are unchanged. TIV.Anchor keeps ownership -- it does not
+    -- register the spikes with TIV.Ground, so nothing measures them twice.
+    --
+    -- With UseForSpikes off, the original two-point geometry below is used.
+    local grips
+    if TIV.Ground and TIV.Ground.GripPoints and tobool(TIV.GroundSetting("UseForSpikes", 1)) then
+        local span = math.max(2, tonumber(cfg.SoilGripLength or 14) or 14)
+        grips = TIV.Ground.GripPoints(spike, {
+            axis      = ramDir,
+            lateral   = lateral,
+            firstGrip = math.max(1, tonumber(cfg.SoilAnchorDepth or 5) or 5),
+            -- Half the old span between grips, so a 3-grip set covers the same
+            -- buried length the 2-grip set did, with one more in the middle.
+            spacing   = math.max(1, span * 0.5),
+        })
+    end
+
+    if not grips or #grips == 0 then
+        local grip = math.max(2, tonumber(cfg.SoilGripLength or 14) or 14)
+        local top  = math.max(1, tonumber(cfg.SoilAnchorDepth or 5) or 5)
+        grips = {
+            { depth = top,         localPos = Vector(top,        0, 0), point = spikePos + ramDir *  top         - right * lateral },
+            { depth = top + grip,  localPos = Vector(top + grip, 0, 0), point = spikePos + ramDir * (top + grip) + right * lateral },
+        }
+    end
+
     local world = game.GetWorld()
 
     local constant = math.max(200, tonumber(cfg.EmbedConstant or 6000) or 6000)
     local damping  = math.max(10, tonumber(cfg.EmbedDamping or 400) or 400)
 
     spikeData.embedConstant = constant
-    spikeData.anchorDepth   = top
-    spikeData.gripLength    = grip
+    -- Deepest and shallowest grip, straight off whatever geometry was chosen,
+    -- so the bookkeeping cannot disagree with it.
+    spikeData.anchorDepth = grips[#grips] and grips[#grips].depth or 0
+    spikeData.gripCount   = #grips
 
     local made = 0
     for _, g in ipairs(grips) do
