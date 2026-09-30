@@ -5,9 +5,12 @@
 --              leave it alone (SetAnchoredImmunity). Stress feedback only.
 --   Failing  : once the wind passes the threshold the storm acts on the
 --              chassis (data.gravityReleased lets sv_wind push it), the airbag
---              springs are dropped and the spikes tear out of the ground
---              windward first, each riding on at the extension it had. The
---              cascade runs faster the further over the threshold the wind is.
+--              springs pop first -- audibly, mount by mount -- and then the
+--              spike ballsockets let go ONE AT A TIME, windward end first
+--              (front or back depending on where the wind is), each spike
+--              riding on at the extension it had. The cascade runs faster the
+--              further over the threshold the wind is, but never so fast that
+--              the individual anchor failures blur into one teardown.
 --   Loft     : when the last spike goes (or the chassis has already lifted
 --              40 u) the hold is severed. With tiv_loft_cinematic the funnel
 --              holds the chassis in a sustained updraft, carries it downwind
@@ -105,7 +108,9 @@ local function CleanupLoftTracking(entIdx)
     TIV.Loft.FailingGroups[entIdx] = nil
     local data = TIV.Deploy.Vehicles and TIV.Deploy.Vehicles[entIdx]
     if data and data.state == "anchored" then data.gravityReleased = false end
-    for wave = 1, 3 do
+    for wave = 1, 16 do
+        -- One timer per live spike in the cascade (was one per wave when the
+        -- teardown fired in three bursts).
         timer.Remove("TIV_WaveFail_" .. entIdx .. "_" .. wave)
     end
 end
@@ -248,9 +253,35 @@ function TIV.Loft.StartDirectionalFailure(veh, data)
 
     -- From here the storm is allowed to act on the chassis (sv_wind applies
     -- its force to an anchored vehicle only while gravityReleased is set), so
-    -- the vehicle strains against the spikes that are left, and the airbag
-    -- springs are dropped: pads on the ground cannot hold a vehicle down
-    -- against lift, only the spikes can.
+    -- the vehicle strains against the spikes that are left.
+    --
+    -- THE AIRBAGS GO FIRST, and visibly: the springs that pulled the chassis
+    -- onto its suspension are the soft part of the hold and pads on the ground
+    -- cannot fight lift anyway. They blow at every remaining mount -- sparks
+    -- and a pneumatic pop -- before the first spike lets go. From here only
+    -- the spikes hold the vehicle.
+    local pd = data.pullDown
+    if pd then
+        local popped = 0
+        for _, e in ipairs(pd.elastics or {}) do
+            if IsValid(e.con) then
+                popped = popped + 1
+                local lp = e.localPos
+                if lp then
+                    local ed = EffectData()
+                    ed:SetOrigin(veh:LocalToWorld(Vector(lp.x, lp.y, lp.z)))
+                    ed:SetMagnitude(4)
+                    ed:SetScale(1.5)
+                    util.Effect("Sparks", ed)
+                end
+            end
+        end
+        if popped > 0 then
+            veh:EmitSound("physics/metal/metal_box_break2.wav", 90, 130)
+            veh:EmitSound("physics/metal/metal_box_strain2.wav", 80, 60)
+            util.ScreenShake(veh:GetPos(), 5, 10, 0.4, 500)
+        end
+    end
     data.gravityReleased = true
     TIV.Anchor.ReleaseSprings(veh, data)
 
@@ -276,25 +307,12 @@ function TIV.Loft.StartDirectionalFailure(veh, data)
         sd._windExposure = lpos:Dot(localWind)
     end
 
+    -- Sort ascending: the most UPWIND mounts (negative projection along the
+    -- downwind vector) come first. Whichever end faces the wind -- front or
+    -- back -- is the end that tears out first.
     table.sort(liveSpikes, function(a, b)
         return (a._windExposure or 0) < (b._windExposure or 0)
     end)
-
-    -- Partition into 3 rapid failure waves, windward first. Every spike lands
-    -- in a wave regardless of count, otherwise leftover anchors would hold the
-    -- vehicle down forever after the sequence "finished".
-    local count = #liveSpikes
-    local wave1, wave2, wave3 = {}, {}, {}
-    for i, sd in ipairs(liveSpikes) do
-        local frac = (i - 1) / count
-        if frac < 1 / 3 then
-            table.insert(wave1, sd)
-        elseif frac < 2 / 3 or count == 2 and i == 2 then
-            table.insert(count == 2 and wave3 or wave2, sd)
-        else
-            table.insert(wave3, sd)
-        end
-    end
 
     -- The further over its threshold the vehicle is, the faster the load
     -- transfers from each torn spike to the next: the cascade is compressed
@@ -303,18 +321,23 @@ function TIV.Loft.StartDirectionalFailure(veh, data)
         or TIV.Config.LoftWindThreshold or 180
     local overshoot = math.Clamp(TIV.Wind.GetSpeed(veh) / math.max(threshold, 1), 1, 2)
 
-    print(string.format("[TIV] Vehicle #%d exceeding threshold (%.2fx). Anchors tearing out windward first (W1: %d, W2: %d, W3: %d)",
-        entIndex, overshoot, #wave1, #wave2, #wave3))
+    print(string.format(
+        "[TIV] Vehicle #%d exceeding threshold (%.2fx). Airbags blown, anchors tearing out one by one, windward first (%d live)",
+        entIndex, overshoot, #liveSpikes))
 
-    local waves = { { wave1, 0.05 }, { wave2, 0.35 }, { wave3, 0.70 } }
-    for n, w in ipairs(waves) do
-        local list, delay = w[1], w[2]
-        if #list > 0 then
-            timer.Create("TIV_WaveFail_" .. entIndex .. "_" .. n, delay / overshoot, 1, function()
-                if not IsValid(veh) or data.state ~= "anchored" then return end
-                TIV.Loft.FailSpikeList(veh, data, list, 0.25 / overshoot)
-            end)
-        end
+    -- One spike at a time, windward end first (the sort above put the most
+    -- upwind mounts at the front of the list). Each interval is compressed by
+    -- how far over the threshold the storm is -- 2x the threshold fails the
+    -- anchors roughly twice as fast -- but the floor keeps every individual
+    -- pop readable: anchor after anchor letting go, not one instant teardown.
+    -- Every spike gets a timer regardless of count, so leftovers can never
+    -- hold the vehicle down after the sequence "finished".
+    local interval = math.Clamp(1.1 / overshoot, 0.35, 1.4)
+    for i, sd in ipairs(liveSpikes) do
+        timer.Create("TIV_WaveFail_" .. entIndex .. "_" .. i, (i - 1) * interval, 1, function()
+            if not IsValid(veh) or data.state ~= "anchored" then return end
+            TIV.Loft.FailSpikeList(veh, data, { sd }, 0.2)
+        end)
     end
 end
 
