@@ -23,7 +23,6 @@ local function applyRuntimeSpikeConfig()
 
     TIV.Config.SpikeCount           = count
     TIV.Config.SpikeForceLimit      = force
-    TIV.Config.BallSocketForceLimit = force
 end
 
 -- Visibility is deliberately independent from spike count. Hidden spikes keep

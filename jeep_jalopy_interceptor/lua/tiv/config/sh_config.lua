@@ -149,15 +149,14 @@ TIV.Config.SpikeDriveDepth      = 15
 TIV.Config.SpikeDriveDuration   = 3.0
 TIV.Config.SpikeRetractDuration = 3.0
 
--- ANCHOR / BALLSOCKET
--- Force limit of 0 = script-failed only (the loft cascade removes sockets
--- explicitly, and joints cannot silently break under wind). A real value
--- makes the anchor sockets breakable under load: when the vortex pushes
--- harder than the limit, sockets snap physically and the remaining ones
--- inherit the load -- an emergent, accelerating cascade on top of the
--- scripted one. tiv_cheat_godmode_anchors always forces 0.
+-- ANCHOR / STAKES
+-- The hold is real-time stake forces, not joints: each planted spike carries
+-- a measurable load and tears out when its load passes its break force.
+-- StakeBreakForce is that break point in multiples of vehicle weight
+-- (tiv_spike_force > 0 overrides it with an absolute value; 0 there means
+-- "use this"). tiv_cheat_godmode_anchors makes stakes unbreakable.
 TIV.Config.SpikeForceLimit      = 0
-TIV.Config.BallSocketForceLimit = 0
+TIV.Config.StakeBreakForce      = 5.5
 TIV.Config.AnchorPivotLimit     = 28
 
 -- LOFT MECHANICS

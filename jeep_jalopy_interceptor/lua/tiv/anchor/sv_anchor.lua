@@ -10,12 +10,18 @@
 --             pulled down onto its own suspension by real constraint force;
 --             the raycast wheels compress exactly as far as the suspension
 --             allows. Independent of how many spikes are fitted.
---   Lock    : limited ballsockets between chassis and planted spikes hold the
---             pulled-down pose (world sockets when no spikes are fitted).
---             The pull-down springs STAY attached and tense the whole anchored
---             state: sockets pin the pose, springs pre-load it down. With a
---             real force limit (tiv_spike_force > 0) the sockets are breakable
---             under load; at 0 only the loft system removes them.
+--   Lock    : planted spikes pin the chassis in real time -- no ballsocket
+--             joint between chassis and spike. Every tick the hold thinks, it
+--             measures how far the spike's mount point has drifted from where
+--             the spike planted and applies a restoring spring-damper force at
+--             that point (world sockets take this job when no spikes are
+--             fitted). At rest the stakes carry nothing; in wind the body
+--             visibly strains, rocks on the planted spikes and each spike
+--             carries a measurable load. When a spike's load passes its break
+--             force it tears out -- which spike goes first is decided by the
+--             wind, not a script. The pull-down springs STAY attached and
+--             tense the whole anchored state: stakes pin, springs pre-load
+--             down. tiv_cheat_godmode_anchors makes the stakes unbreakable.
 --
 -- The chassis physics object is never frozen, never teleported and keeps its
 -- gravity throughout. Releasing the constraints is what raises the vehicle:
@@ -322,97 +328,198 @@ function TIV.Anchor.ReleaseCoveredSprings(veh, data)
     end
 end
 
--- Drops the ballsockets only; the springs (if any) keep the body down.
+-- Releases the hold: the stake forces stop and any world sockets go. The
+-- springs (if any) keep the body down until their own release step.
 function TIV.Anchor.ReleaseLock(veh, data)
+    TIV.Anchor.ReleaseStakes(veh, data)
     RemoveByType(data, "ballsocket")
 end
 
 -- ============================================================================
--- LOCK (limited ballsocket chassis <-> spike at the settled pose)
--- These are the addon's own anchor sockets, tuned for one job: pin the
--- settled pose while the airbag springs pre-load it down, and -- when the
--- player has set a real force limit -- snap under a load the wind puts on
--- them, so a violent vortex can tear anchors out physically instead of the
--- failure sequence being purely scripted.
+-- STAKES (real-time hold, no chassis<->spike joint)
+-- A planted spike is already welded to the world (PlantSingle). What holds the
+-- CHASSIS is the stake force: every tick, for every planted spike, the mount
+-- point of the chassis is spring-damper pulled back toward the pose the
+-- vehicle settled in when the spike bit the ground. At rest the drift is zero
+-- and the stakes apply nothing at all. Under wind the drift grows, the force
+-- ramps, the body strains and rocks on the planted spikes, and a spike whose
+-- carried load exceeds its break force is torn out by the loft module --
+-- physically, in load order (the windward spikes carry the most).
 -- ============================================================================
--- Force limit for one anchor socket. tiv_spike_force > 0 means the player
--- asked for breakable anchors: the socket snaps when the load on it exceeds
--- the limit, and the remaining sockets inherit that load -- a natural,
--- accelerating cascade on top of the scripted one. 0 keeps them script-only
--- (the factory default). The godmode cheat always wins.
-local function SocketForceLimit()
+-- Break force for one stake, as multiples of vehicle weight. tiv_spike_force
+-- > 0 overrides it with an absolute value; the godmode cheat makes stakes
+-- unbreakable. Strength gets a per-stake +-15% variance so failures space out
+-- organically instead of in lockstep.
+local STAKE_TICK = 0.015
+
+local function StakeBaseCap(veh)
     local god = GetConVar("tiv_cheat_godmode_anchors")
-    if god and god:GetBool() then return 0 end
+    if god and god:GetBool() then return math.huge end
     local cv = GetConVar("tiv_spike_force")
-    local limit = cv and cv:GetFloat() or 0
-    if limit and limit > 0 then return limit end
-    return TIV.Config.BallSocketForceLimit or 0
+    local absolute = cv and cv:GetFloat() or 0
+    if absolute and absolute > 0 then return absolute end
+    local phys = veh:GetPhysicsObject()
+    local mass = IsValid(phys) and math.max(phys:GetMass(), 100) or 800
+    return mass * 600 * (TIV.Config.StakeBreakForce or 5.5)
+end
+
+local function StartStakeThink(veh, data)
+    if data._stakeTimer then return end
+    local timerName = "TIV_StakeHold_" .. veh:EntIndex()
+    data._stakeTimer = timerName
+    timer.Create(timerName, STAKE_TICK, 0, function()
+        if not IsValid(veh) or not data.stakes or data.state ~= "anchored" then
+            timer.Remove(timerName)
+            if data then data._stakeTimer = nil end
+            return
+        end
+        TIV.Anchor.StakeThink(veh, data)
+    end)
 end
 
 function TIV.Anchor.AttachSingle(veh, data, spikeData, spikeTableIndex)
     if not IsValid(veh) or not IsValid(spikeData.entity) then return end
     spikeData.tableIndex = spikeTableIndex or spikeData.tableIndex
 
-    local spike = spikeData.entity
-    local sp = spike:GetPhysicsObject()
-    if IsValid(sp) and sp:IsMotionEnabled() then
-        sp:SetVelocity(vector_origin)
-        sp:SetAngleVelocity(vector_origin)
-        sp:EnableMotion(false)
+    data.stakes = data.stakes or {}
+    for _, st in ipairs(data.stakes) do
+        if st.sd == spikeData then return end -- already staked
     end
 
-    local limit = GetPivotLimit()
-    local localAttachPos = veh:WorldToLocal(spike:GetPos())
-    local bs = constraint.AdvBallsocket(
-        veh, spike, 0, 0,
-        localAttachPos, vector_origin,
-        SocketForceLimit(), 0,
-        -limit, -limit, -limit,
-         limit,  limit,  limit,
-        0, 0, 0,
-        0, 0, 0,
-        1
-    )
-    if IsValid(bs) then
-        Track(data, bs, spikeData, "ballsocket", { localPos = localAttachPos })
-    else
-        print("[TIV] WARNING: Ballsocket failed for spike " .. tostring(spikeData.index))
-    end
-
-    local hasNoCollide = false
-    for _, c in ipairs(data.constraints or {}) do
-        if c.type == "nocollide" and c.spikeIndex == spikeData.index and IsValid(c.constraint) then
-            hasNoCollide = true
-            break
-        end
-    end
-    if not hasNoCollide then
-        local nocol = constraint.NoCollide(veh, spike, 0, 0)
-        if IsValid(nocol) then Track(data, nocol, spikeData, "nocollide") end
-    end
+    local anchor = spikeData.plantedPos or spikeData.entity:GetPos()
+    data.stakes[#data.stakes + 1] = {
+        sd       = spikeData,
+        localPos = veh:WorldToLocal(anchor),
+        anchor   = Vector(anchor.x, anchor.y, anchor.z),
+        strength = 0.85 + math.random() * 0.30,
+        load     = 0,
+    }
+    StartStakeThink(veh, data)
 end
 
 function TIV.Anchor.AttachAll(veh, data)
     if not IsValid(veh) then return end
     for i, sd in ipairs(data.spikes or {}) do
-        if sd.phase == "deployed" and IsValid(sd.entity) then
-            local has = false
-            for _, c in ipairs(data.constraints or {}) do
-                if c.type == "ballsocket" and c.spikeIndex == sd.index and IsValid(c.constraint) then
-                    has = true
-                    break
-                end
-            end
-            if not has then TIV.Anchor.AttachSingle(veh, data, sd, i) end
+        if sd.phase == "deployed" and not sd.failed and IsValid(sd.entity) then
+            TIV.Anchor.AttachSingle(veh, data, sd, i)
         end
     end
 end
 
--- 0-spike mode: hold the chassis to the world directly. One socket per mount
+-- Current break force of one stake: base x per-stake variance, decayed once
+-- the failure sequence has started (data._stakeWeakenStart). The decay means
+-- sustained over-threshold wind ALWAYS wins eventually -- physically, because
+-- the spikes are progressively tearing loose -- and faster the harder the
+-- wind blows (rate is set at failure start from the overshoot).
+local function StakeCap(veh, data, stake, base)
+    if base == math.huge then return math.huge end
+    local cap = base * (stake.strength or 1)
+    if data._stakeWeakenStart then
+        local age = math.max(0, CurTime() - data._stakeWeakenStart)
+        cap = cap * math.max(0.12, math.exp(-(data._stakeWeakenRate or 0.25) * age))
+    end
+    return cap
+end
+
+function TIV.Anchor.StakeThink(veh, data)
+    local phys = veh:GetPhysicsObject()
+    if not IsValid(phys) then return end
+    local base  = StakeBaseCap(veh)
+    local mass  = math.max(phys:GetMass(), 100)
+    local now   = CurTime()
+    local debug = GetConVar("tiv_debug_freeze") and GetConVar("tiv_debug_freeze"):GetBool()
+
+    for si = #data.stakes, 1, -1 do
+        local stake = data.stakes[si]
+        local sd    = stake.sd
+        if not sd or sd.failed or sd.phase ~= "deployed" or not IsValid(sd.entity) then
+            table.remove(data.stakes, si)
+        else
+            local P     = veh:LocalToWorld(stake.localPos)
+            local delta = P - stake.anchor
+            local drift = delta:Length()
+            stake.load  = 0
+
+            -- Rest (or near-rest): the stake carries nothing. A fully
+            -- anchored, calm vehicle gets zero applied force.
+            if drift > 0.75 or stake.carrying then
+                local v = phys:GetVelocityAtPoint(P)
+                stake.carrying = drift > 0.75
+
+                -- Stiffness: ~10 units of visible give at the break force.
+                local k = base * 0.10 / math.max(1, stake.strength)
+                local c = math.sqrt(k * mass) * 0.30
+                local F = delta * -k - v * c
+
+                -- One-sided: the stake only ever PULLS the mount back toward
+                -- its planted spot (it is buried in the ground, not a strut
+                -- from below). If the chassis is already returning on its
+                -- own, let it.
+                if F:Dot(-delta) > 0 then
+                    local cap  = StakeCap(veh, data, stake, base)
+                    local need = F:Length()
+                    if need > cap then
+                        stake.load = need
+                        if TIV.Loft and TIV.Loft.TearSpike then
+                            TIV.Loft.TearSpike(veh, data, sd)
+                        end
+                        if debug then
+                            print(string.format("[TIV] stake %d on #%d overloaded: %.0f > cap %.0f",
+                                sd.index or 0, veh:EntIndex(), need, cap))
+                        end
+                    else
+                        stake.load = need
+                        phys:ApplyForceOffset(F:GetNormalized() * need, P)
+
+                        -- Strain feedback: creaks past 65% of the cap, sparks
+                        -- past 90% -- you can hear the spikes giving before
+                        -- they go.
+                        if cap ~= math.huge then
+                            local frac = need / cap
+                            if frac > 0.65 and now > (stake.nextCreak or 0) then
+                                stake.nextCreak = now + 0.5 + math.random() * 0.7
+                                sd.entity:EmitSound("physics/metal/metal_box_strain" .. math.random(1, 4) .. ".wav", 75, math.random(45, 60))
+                            end
+                            if frac > 0.90 and now > (stake.nextSpark or 0) then
+                                stake.nextSpark = now + 0.25
+                                local ed = EffectData()
+                                ed:SetOrigin(P)
+                                ed:SetMagnitude(2)
+                                ed:SetScale(1)
+                                util.Effect("Sparks", ed)
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end
+end
+
+function TIV.Anchor.ReleaseStakes(veh, data)
+    if data._stakeTimer then
+        timer.Remove(data._stakeTimer)
+        data._stakeTimer = nil
+    end
+    data.stakes = nil
+end
+
+-- 0-spike mode fallback: hold the chassis to the world directly. One socket per mount
 -- point (the same corners the springs pulled on), so the pose is fixed by
 -- geometry exactly as it is by four planted spikes. A single centre socket
 -- left the chassis free to rotate into its angular limits, and the compressed
 -- suspension pushing against those limits is what shook the vehicle.
+-- With no spikes there is nothing to stake, so these joints do the holding;
+-- they are unbreakable unless the player sets a real tiv_spike_force.
+local function WorldSocketForceLimit()
+    local god = GetConVar("tiv_cheat_godmode_anchors")
+    if god and god:GetBool() then return 0 end
+    local cv = GetConVar("tiv_spike_force")
+    local absolute = cv and cv:GetFloat() or 0
+    if absolute and absolute > 0 then return absolute end
+    return 0
+end
+
 function TIV.Anchor.AttachWorld(veh, data)
     if not IsValid(veh) then return end
     local world = game.GetWorld()
@@ -423,7 +530,7 @@ function TIV.Anchor.AttachWorld(veh, data)
         local bs = constraint.AdvBallsocket(
             veh, world, 0, 0,
             mountLocal, veh:LocalToWorld(mountLocal),
-            SocketForceLimit(), 0,
+            WorldSocketForceLimit(), 0,
             -limit, -limit, -limit,
              limit,  limit,  limit,
             0, 0, 0,
@@ -459,6 +566,7 @@ TIV.Anchor.EnsureLive = TIV.Anchor.UnfreezeForDeploy
 -- DETACH
 -- ============================================================================
 function TIV.Anchor.DetachAll(veh, data)
+    TIV.Anchor.ReleaseStakes(veh, data)
     for _, c in ipairs(data.constraints or {}) do
         if IsValid(c.constraint) then c.constraint:Remove() end
     end
@@ -512,6 +620,17 @@ end
 -- QUERIES
 -- ============================================================================
 function TIV.Anchor.CheckIntegrity(veh, data)
+    local liveStakes = 0
+    for i = #(data.stakes or {}), 1, -1 do
+        local sd = data.stakes[i].sd
+        if sd and not sd.failed and sd.phase == "deployed" and IsValid(sd.entity) then
+            liveStakes = liveStakes + 1
+        else
+            table.remove(data.stakes, i)
+        end
+    end
+    if liveStakes > 0 then return true end
+
     if not data.constraints then return true end
     local ballsockets = 0
     for i = #data.constraints, 1, -1 do
@@ -526,7 +645,15 @@ function TIV.Anchor.CheckIntegrity(veh, data)
 end
 
 function TIV.Anchor.GetCounts(data)
-    local counts = { total = 0, ballsockets = 0, anchors = 0, nocollide = 0, elastics = 0 }
+    local counts = { total = 0, ballsockets = 0, anchors = 0, nocollide = 0, elastics = 0, stakes = 0 }
+    for _, st in ipairs(data.stakes or {}) do
+        local sd = st.sd
+        if sd and not sd.failed and sd.phase == "deployed" and IsValid(sd.entity) then
+            counts.stakes = counts.stakes + 1
+            counts.total  = counts.total + 1
+            counts.ballsockets = counts.ballsockets + 1 -- wire/E2 "anchor count"
+        end
+    end
     for _, c in ipairs(data.constraints or {}) do
         if IsValid(c.constraint) then
             counts.total = counts.total + 1

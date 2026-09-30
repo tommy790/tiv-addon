@@ -5,12 +5,12 @@
 --              leave it alone (SetAnchoredImmunity). Stress feedback only.
 --   Failing  : once the wind passes the threshold the storm acts on the
 --              chassis (data.gravityReleased lets sv_wind push it), the airbag
---              springs pop first -- audibly, mount by mount -- and then the
---              spike ballsockets let go ONE AT A TIME, windward end first
---              (front or back depending on where the wind is), each spike
---              riding on at the extension it had. The cascade runs faster the
---              further over the threshold the wind is, but never so fast that
---              the individual anchor failures blur into one teardown.
+--              springs pop first -- audibly, releasing real tension -- and
+--              then the stakes physically overload one at a time. There is no
+--              scripted break order: each spike's break force decays while the
+--              storm holds, and the windward spikes carry the most load, so
+--              the front or back tears out first depending on where the wind
+--              is. Each torn spike rides on at the extension it had.
 --   Loft     : when the last spike goes (or the chassis has already lifted
 --              40 u) the hold is severed and that is the entire loft. This
 --              addon applies no forces of its own afterwards: the wind system
@@ -98,11 +98,12 @@ local function CleanupLoftTracking(entIdx)
     TIV.Loft.WindTimers[entIdx]    = nil
     TIV.Loft.FailingGroups[entIdx] = nil
     local data = TIV.Deploy.Vehicles and TIV.Deploy.Vehicles[entIdx]
-    if data and data.state == "anchored" then data.gravityReleased = false end
-    for wave = 1, 16 do
-        -- One timer per live spike in the cascade (was one per wave when the
-        -- teardown fired in three bursts).
-        timer.Remove("TIV_WaveFail_" .. entIdx .. "_" .. wave)
+    if data and data.state == "anchored" then
+        data.gravityReleased   = false
+        -- Calm reset: restore the stakes' full break force, the hold
+        -- re-stabilizes on whatever spikes are left.
+        data._stakeWeakenStart = nil
+        data._stakeWeakenRate  = nil
     end
 end
 TIV.Loft.CleanupTracking = CleanupLoftTracking
@@ -173,57 +174,67 @@ function TIV.Loft.CheckArmorTear(veh, windMPH, windForceVec)
 end
 
 -- ============================================================================
--- FAIL SPIKE LIST (SEQUENTIAL WAVE EXECUTION)
+-- TEAR SPIKE (the physical failure of one planted spike)
+-- Called by the stake hold when a spike's carried load passes its break force
+-- (and by the legacy list helper below). The ground gives: the spike is
+-- pulled out and rides with the chassis at the extension it had. Every
+-- constraint on it goes (ground weld, nocollide); with the wind now acting on
+-- the chassis (gravityReleased) the freed side lurches and the spike visibly
+-- slides out of the earth while the others take its load.
 -- ============================================================================
-function TIV.Loft.FailSpikeList(veh, data, spikesToFail, duration)
+function TIV.Loft.TearSpike(veh, data, sd)
+    if not IsValid(veh) or not data or not sd then return false end
+    if sd.failed or data.state ~= "anchored" then return false end
     local cheatGodmode = GetConVar("tiv_cheat_godmode_anchors")
-    if cheatGodmode and cheatGodmode:GetBool() then return end
-    if not IsValid(veh) or not data or #spikesToFail == 0 then return end
+    if cheatGodmode and cheatGodmode:GetBool() then return false end
 
+    sd.failed = true
+    TIV.Anchor.UnplantSingle(veh, data, sd.index)
+
+    local spikeEnt = sd.entity
+    if IsValid(spikeEnt) then
+        local sparkFX = EffectData()
+        sparkFX:SetOrigin(spikeEnt:GetPos())
+        sparkFX:SetMagnitude(8)
+        sparkFX:SetScale(3)
+        util.Effect("Sparks", sparkFX)
+        spikeEnt:EmitSound("physics/metal/metal_box_break" .. math.random(1, 2) .. ".wav", 90, math.random(60, 80))
+        if TIV.SpikeAnim and TIV.SpikeAnim.ReparentSpikeTorn then
+            TIV.SpikeAnim.ReparentSpikeTorn(veh, spikeEnt, sd)
+        end
+    end
+    if data.spikeAnims then data.spikeAnims[sd.index] = "torn" end
+
+    net.Start("TIV_AnchorWarning")
+        net.WriteEntity(veh)
+        net.WriteUInt(sd.index or 0, 8)
+    net.Broadcast()
+    hook.Run("TIV_SpikeFailure", veh, sd.index)
+
+    -- Last hold gone? (world sockets in 0-spike mode never enter this path)
+    local remaining = 0
+    for _, other in ipairs(data.spikes or {}) do
+        if other.phase == "deployed" and not other.failed and IsValid(other.entity) then
+            remaining = remaining + 1
+        end
+    end
+    if remaining == 0 then
+        TIV.Loft.TriggerLoft(veh, data)
+    end
+    return true
+end
+
+-- Legacy helper: tear a list of spikes with a fixed stagger. The physical
+-- cascade in the stake hold decides order on its own now; this remains for
+-- anything that wants an explicit teardown.
+function TIV.Loft.FailSpikeList(veh, data, spikesToFail, duration)
+    if not IsValid(veh) or not data or #spikesToFail == 0 then return end
     veh:EmitSound("physics/metal/metal_box_break1.wav", 88, 55)
     local staggerPerSpike = (duration or 0.3) / math.max(1, #spikesToFail)
-
     for i, sd in ipairs(spikesToFail) do
-        local spikeIdx = sd.index
         timer.Simple((i - 1) * staggerPerSpike, function()
             if not IsValid(veh) or data.state ~= "anchored" then return end
-            if sd.failed then return end
-            sd.failed = true
-
-            -- The ground gives: the spike is pulled out and rides with the
-            -- chassis at the extension it had. Every constraint on it goes
-            -- (hold, ground weld, nocollide); with the wind now acting on the
-            -- chassis (gravityReleased) the freed side lifts and the spike
-            -- visibly slides out of the earth while the others still hold.
-            TIV.Anchor.UnplantSingle(veh, data, spikeIdx)
-
-            local spikeEnt = sd.entity
-            if IsValid(spikeEnt) then
-                local sparkFX = EffectData()
-                sparkFX:SetOrigin(spikeEnt:GetPos())
-                sparkFX:SetMagnitude(8)
-                sparkFX:SetScale(3)
-                util.Effect("Sparks", sparkFX)
-                spikeEnt:EmitSound("physics/metal/metal_box_break" .. math.random(1, 2) .. ".wav", 90, math.random(60, 80))
-                if TIV.SpikeAnim and TIV.SpikeAnim.ReparentSpikeTorn then
-                    TIV.SpikeAnim.ReparentSpikeTorn(veh, spikeEnt, sd)
-                end
-            end
-            if data.spikeAnims then data.spikeAnims[spikeIdx] = "torn" end
-
-            net.Start("TIV_AnchorWarning")
-                net.WriteEntity(veh)
-                net.WriteUInt(spikeIdx, 8)
-            net.Broadcast()
-            hook.Run("TIV_SpikeFailure", veh, spikeIdx)
-
-            local remaining = 0
-            for _, c in ipairs(data.constraints or {}) do
-                if c.type == "ballsocket" and IsValid(c.constraint) then remaining = remaining + 1 end
-            end
-            if remaining == 0 then
-                TIV.Loft.TriggerLoft(veh, data)
-            end
+            TIV.Loft.TearSpike(veh, data, sd)
         end)
     end
 end
@@ -249,8 +260,8 @@ function TIV.Loft.StartDirectionalFailure(veh, data)
     -- THE AIRBAGS GO FIRST, and visibly. The springs are still attached and
     -- TENSE the whole anchored state (FinalizeAnchored keeps them), so this
     -- pop releases genuinely stored tension: sparks and a pneumatic crack at
-    -- every mount and the chassis physically drops the rest of the way onto
-    -- the sockets. From here only the spikes hold the vehicle.
+    -- every mount and the chassis lurches onto the stakes alone -- which now
+    -- carry it in visible tension, straining against the wind.
     local pd = data.pullDown
     if pd then
         local popped = 0
@@ -305,31 +316,23 @@ function TIV.Loft.StartDirectionalFailure(veh, data)
         return (a._windExposure or 0) < (b._windExposure or 0)
     end)
 
-    -- The further over its threshold the vehicle is, the faster the load
-    -- transfers from each torn spike to the next: the cascade is compressed
-    -- by the overshoot (up to 2x at twice the threshold).
+    -- The further over its threshold the vehicle is, the faster its stakes
+    -- weaken: the decay rate below scales with the overshoot (2x at twice
+    -- the threshold).
     local threshold = (veh._TIVEffectiveStats and veh._TIVEffectiveStats.effective_loft_mph)
         or TIV.Config.LoftWindThreshold or 180
     local overshoot = math.Clamp(TIV.Wind.GetSpeed(veh) / math.max(threshold, 1), 1, 2)
 
     print(string.format(
-        "[TIV] Vehicle #%d exceeding threshold (%.2fx). Airbags blown, anchors tearing out one by one, windward first (%d live)",
+        "[TIV] Vehicle #%d exceeding threshold (%.2fx). Airbags blown -- stakes weakening, windward will overload first (%d live)",
         entIndex, overshoot, #liveSpikes))
 
-    -- One spike at a time, windward end first (the sort above put the most
-    -- upwind mounts at the front of the list). Each interval is compressed by
-    -- how far over the threshold the storm is -- 2x the threshold fails the
-    -- anchors roughly twice as fast -- but the floor keeps every individual
-    -- pop readable: anchor after anchor letting go, not one instant teardown.
-    -- Every spike gets a timer regardless of count, so leftovers can never
-    -- hold the vehicle down after the sequence "finished".
-    local interval = math.Clamp(1.1 / overshoot, 0.35, 1.4)
-    for i, sd in ipairs(liveSpikes) do
-        timer.Create("TIV_WaveFail_" .. entIndex .. "_" .. i, (i - 1) * interval, 1, function()
-            if not IsValid(veh) or data.state ~= "anchored" then return end
-            TIV.Loft.FailSpikeList(veh, data, { sd }, 0.2)
-        end)
-    end
+    -- No scripted break order. From here every stake's break force decays
+    -- (rate from the overshoot), and which spike tears first is decided by
+    -- the load each one actually carries in the stake hold -- the windward
+    -- end carries the most, so it goes first, on its own.
+    data._stakeWeakenStart = CurTime()
+    data._stakeWeakenRate  = 0.22 * overshoot
 end
 
 -- ============================================================================
@@ -506,18 +509,15 @@ local function ProcessAnchored(entIndex, veh, data)
 
     local isFailing = TIV.Loft.FailingGroups[entIndex] or data.gravityReleased
 
-    -- A planted spike that lost its ballsocket outside a failure sequence
-    -- (e.g. an admin cleanup) is re-locked; during failure it counts as gone.
+    -- A planted spike that lost its stake outside a failure sequence
+    -- (e.g. an admin cleanup) is re-staked; during failure it counts as gone.
     for i, sd in ipairs(data.spikes or {}) do
         if sd.phase == "deployed" and not sd.failed and IsValid(sd.entity) then
-            local hasBS = false
-            for _, c in ipairs(data.constraints or {}) do
-                if c.spikeIndex == sd.index and c.type == "ballsocket" and IsValid(c.constraint) then
-                    hasBS = true
-                    break
-                end
+            local hasStake = false
+            for _, st in ipairs(data.stakes or {}) do
+                if st.sd == sd then hasStake = true break end
             end
-            if not hasBS then
+            if not hasStake then
                 if isFailing or distFromPlanted > 20 then
                     sd.failed = true
                 else
@@ -527,12 +527,14 @@ local function ProcessAnchored(entIndex, veh, data)
         end
     end
 
-    local liveBallsockets = 0
-    for _, c in ipairs(data.constraints or {}) do
-        if c.type == "ballsocket" and IsValid(c.constraint) then liveBallsockets = liveBallsockets + 1 end
+    local liveStakes = 0
+    for _, sd in ipairs(data.spikes or {}) do
+        if sd.phase == "deployed" and not sd.failed and IsValid(sd.entity) then
+            liveStakes = liveStakes + 1
+        end
     end
-    if liveBallsockets == 0 and TIV.Spikes.GetCount(data) > 0 then
-        print(string.format("[TIV] All anchor constraints lost on #%d - triggering immediate loft!", entIndex))
+    if liveStakes == 0 and TIV.Spikes.GetCount(data) > 0 then
+        print(string.format("[TIV] All anchors torn out on #%d - triggering immediate loft!", entIndex))
         TIV.Loft.TriggerLoft(veh, data)
         return
     end
