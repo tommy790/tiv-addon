@@ -1086,15 +1086,23 @@ timer.Create("TIV_WindThink", 0.1, 0, function()
         end
     end
 
-    -- Apply forces only to TIV vehicles (when not solidly anchored) + released spikes (never all props).
+    -- Apply forces only to TIV vehicles + released spikes (never all props).
+    -- Anchored vehicles are NOT shielded: the storm loads the stake hold, so
+    -- the truck visibly leans and strains on its planted spikes as the wind
+    -- builds (that loading is what later tears them out, in load order).
+    -- Only the lowering/deploying phases are shielded -- there the springs are
+    -- still setting the pose and must not fight the wind.
     for _, entry in ipairs(activeVehicles) do
         local state = entry.data and entry.data.state or "idle"
-        local isSolidAnchored = (state == "anchored" and not entry.data.gravityReleased)
-            or (state == "lowering" or state == "deploying_spikes")
+        local isPoseSetting = (state == "lowering" or state == "deploying_spikes")
         local windMPH = TIV.Wind.GetSpeed(entry.veh)
 
-        if not isSolidAnchored and windMPH >= 50 then
-            TIV.Wind.ApplyToEntity(entry.veh, 0.01, entry.veh)
+        if not isPoseSetting and windMPH >= 50 then
+            if state == "anchored" then
+                TIV.Wind.ApplyToEntity(entry.veh, TIV.Config.AnchoredWindCoupling or 0.5, entry.veh)
+            else
+                TIV.Wind.ApplyToEntity(entry.veh, 0.01, entry.veh)
+            end
         end
 
         for _, sd in ipairs(entry.data.spikes or {}) do

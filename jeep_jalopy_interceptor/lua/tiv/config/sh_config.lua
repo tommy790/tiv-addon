@@ -150,13 +150,17 @@ TIV.Config.SpikeDriveDuration   = 3.0
 TIV.Config.SpikeRetractDuration = 3.0
 
 -- ANCHOR / STAKES
--- The hold is real-time stake forces, not joints: each planted spike carries
--- a measurable load and tears out when its load passes its break force.
--- StakeBreakForce is that break point in multiples of vehicle weight
--- (tiv_spike_force > 0 overrides it with an absolute value; 0 there means
--- "use this"). tiv_cheat_godmode_anchors makes stakes unbreakable.
-TIV.Config.SpikeForceLimit      = 0
-TIV.Config.StakeBreakForce      = 5.5
+-- The hold is real-time stake forces, not joints: the storm loads the stakes
+-- (AnchoredWindCoupling), each spike carries a measurable share, and when the
+-- failure sequence starts every stake's break force is set from the load it
+-- is actually carrying x (1 + StakeBreakForce x per-stake variance), then
+-- decays -- so the windward, most-loaded spikes tear out first, physically.
+-- tiv_cheat_godmode_anchors makes stakes unbreakable. StakeStiffness sets how
+-- much give the hold has (higher = stiffer = less visible lean).
+TIV.Config.SpikeForceLimit         = 0
+TIV.Config.StakeBreakForce         = 5.5
+TIV.Config.StakeStiffness          = 50
+TIV.Config.AnchoredWindCoupling    = 0.5
 -- How far the chassis may displace from its planted pose before the hold is
 -- considered physically lost (every remaining stake tears out). Generous on
 -- purpose: the stake hold is soft and visibly strains, gives under load and
@@ -169,9 +173,7 @@ TIV.Config.AnchorPivotLimit     = 28
 -- and the wind system / tornado mods take it from there.
 TIV.Config.LoftWindThreshold    = 160
 
--- Wind force applied to vehicle while anchored
-TIV.Config.AnchoredWindForce    = 0.8
-TIV.Config.AnchoredRockTorque   = 5.5
+
 
 -- WIND
 TIV.Config.WindEnabled          = true

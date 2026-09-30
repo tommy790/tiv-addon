@@ -100,10 +100,13 @@ local function CleanupLoftTracking(entIdx)
     local data = TIV.Deploy.Vehicles and TIV.Deploy.Vehicles[entIdx]
     if data and data.state == "anchored" then
         data.gravityReleased   = false
-        -- Calm reset: restore the stakes' full break force, the hold
-        -- re-stabilizes on whatever spikes are left.
+        -- Calm reset: restore the stakes' full (unbreakable) strength, the
+        -- hold re-stabilizes on whatever spikes are left.
         data._stakeWeakenStart = nil
         data._stakeWeakenRate  = nil
+        for _, stake in ipairs(data.stakes or {}) do
+            stake.cap = nil
+        end
     end
 end
 TIV.Loft.CleanupTracking = CleanupLoftTracking
@@ -327,12 +330,48 @@ function TIV.Loft.StartDirectionalFailure(veh, data)
         "[TIV] Vehicle #%d exceeding threshold (%.2fx). Airbags blown -- stakes weakening, windward will overload first (%d live)",
         entIndex, overshoot, #liveSpikes))
 
-    -- No scripted break order. From here every stake's break force decays
-    -- (rate from the overshoot), and which spike tears first is decided by
-    -- the load each one actually carries in the stake hold -- the windward
-    -- end carries the most, so it goes first, on its own.
-    data._stakeWeakenStart = CurTime()
-    data._stakeWeakenRate  = 0.22 * overshoot
+    -- From here the stakes physically fail in load order -- no script picks
+    -- the order. Two timed steps make that measurement honest:
+    --
+    -- 1. (+0.25s) RE-GRIP: popping the airbags lets the suspension rebound,
+    --    which would otherwise read as a huge vertical stake overload and rip
+    --    everything out in one tick. Instead each stake re-takes its grip on
+    --    the rebounded chassis (the spike shaft absorbs the stroke), and the
+    --    only load left on it is the wind.
+    -- 2. (+0.60s) HAND OUT CAPS: each stake's break force is set from the
+    --    load it is ACTUALLY carrying x (1 + StakeBreakForce x per-stake
+    --    variance), floored so a momentarily unloaded stake is not immortal.
+    --    Break force then decays (rate from the overshoot), so the failure
+    --    self-balances across wind speed, vehicle mass and stake count: the
+    --    windward stakes carry the most and go first, on their own.
+    data._stakeWeakenRate = 0.35 * overshoot
+
+    timer.Simple(0.25, function()
+        if not IsValid(veh) or data.state ~= "anchored" or not data.stakes then return end
+        for _, stake in ipairs(data.stakes) do
+            local sd = stake.sd
+            if sd and not sd.failed and sd.phase == "deployed" and IsValid(sd.entity) then
+                stake.localPos = veh:WorldToLocal(stake.anchor)
+                stake.carrying = false
+            end
+        end
+    end)
+
+    timer.Simple(0.60, function()
+        if not IsValid(veh) or data.state ~= "anchored" or not data.stakes then return end
+        local phys = veh:GetPhysicsObject()
+        local mass = IsValid(phys) and math.max(phys:GetMass(), 100) or 800
+        local floor = mass * 600 * 0.5
+        for _, stake in ipairs(data.stakes) do
+            local sd = stake.sd
+            if sd and not sd.failed and sd.phase == "deployed" and IsValid(sd.entity) then
+                local carried = math.max(stake.load or 0, floor)
+                stake.cap = carried * (1 + (TIV.Config.StakeBreakForce or 5.5) * (stake.strength or 1))
+            end
+        end
+        -- Decay clock starts when the caps exist.
+        data._stakeWeakenStart = CurTime()
+    end)
 end
 
 -- ============================================================================
