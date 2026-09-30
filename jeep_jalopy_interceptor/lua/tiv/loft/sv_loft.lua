@@ -100,12 +100,18 @@ local function CleanupLoftTracking(entIdx)
     local data = TIV.Deploy.Vehicles and TIV.Deploy.Vehicles[entIdx]
     if data and data.state == "anchored" then
         data.gravityReleased   = false
-        -- Calm reset: restore the stakes' full (unbreakable) strength, the
-        -- hold re-stabilizes on whatever spikes are left.
+        -- Calm reset: restore the stakes' standard break caps and stop the
+        -- decay, so the hold re-stabilizes at full strength on whatever
+        -- spikes are left.
         data._stakeWeakenStart = nil
         data._stakeWeakenRate  = nil
+        local veh  = Entity(entIdx)
+        local phys = IsValid(veh) and veh:GetPhysicsObject()
+        local mass = IsValid(phys) and math.max(phys:GetMass(), 100) or nil
         for _, stake in ipairs(data.stakes or {}) do
-            stake.cap = nil
+            if mass then
+                stake.cap0 = mass * 600 * 1.2 * (0.85 + math.random() * 0.30)
+            end
         end
     end
 end
@@ -365,8 +371,11 @@ function TIV.Loft.StartDirectionalFailure(veh, data)
         for _, stake in ipairs(data.stakes) do
             local sd = stake.sd
             if sd and not sd.failed and sd.phase == "deployed" and IsValid(sd.entity) then
+                -- Re-base the break cap on the load this stake is actually
+                -- carrying, then let it decay. Most-loaded (windward) stake
+                -- hits its cap first as everything decays together.
                 local carried = math.max(stake.load or 0, floor)
-                stake.cap = carried * (1 + (TIV.Config.StakeBreakForce or 5.5) * (stake.strength or 1))
+                stake.cap0 = carried * (1 + (TIV.Config.StakeBreakForce or 5.5) * (stake.strength or 1))
             end
         end
         -- Decay clock starts when the caps exist.

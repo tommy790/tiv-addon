@@ -380,17 +380,16 @@ function TIV.Anchor.AttachSingle(veh, data, spikeData, spikeTableIndex)
     local anchor = spikeData.plantedPos or spikeData.entity:GetPos()
     local phys = veh:GetPhysicsObject()
     local mass = IsValid(phys) and math.max(phys:GetMass(), 100) or 800
+    -- Break cap: ~1.2 vehicle weights x per-stake variance. Finite from the
+    -- start -- load is always what tears a stake, no magic phases. The
+    -- failure sequence re-bases these caps from the measured load and decays
+    -- them so a sustained storm always wins.
     data.stakes[#data.stakes + 1] = {
         sd       = spikeData,
+        cap0     = mass * 600 * 1.2 * (0.85 + math.random() * 0.30),
         localPos = veh:WorldToLocal(anchor),
         anchor   = Vector(anchor.x, anchor.y, anchor.z),
-        strength = 0.85 + math.random() * 0.30,
         load     = 0,
-        -- Nominal reference for strain FX before the failure sequence assigns
-        -- real caps (pre-failure stakes are unbreakable, but you should still
-        -- hear them complain as the wind builds).
-        cap0     = mass * 600 * 1.2,
-        cap      = nil,
     }
     StartStakeThink(veh, data)
 end
@@ -411,14 +410,41 @@ function TIV.Anchor.StakeThink(veh, data)
     local now   = CurTime()
     local debug = GetConVar("tiv_debug_freeze") and GetConVar("tiv_debug_freeze"):GetBool()
 
-    -- Soft spring: visible lean under load instead of an invisible rigid pin.
-    local k = mass * (TIV.Config.StakeStiffness or 50)
-    local c = math.sqrt(k * mass) * 0.35
+    -- ---------------------------------------------------------------------------
+    -- STORM LOAD, owned here. The wind force on an anchored vehicle is applied
+    -- by this 66 Hz loop, NOT by the 0.1s wind think -- two unsynchronized
+    -- controllers beating against each other is what made the chassis thrash.
+    -- The force acts on the windward quarter of the chassis (pressure on the
+    -- upwind face), which leans the body downwind and loads the upwind stakes
+    -- hardest: the windward-first tear order emerges from geometry alone.
+    -- ---------------------------------------------------------------------------
+    local coupling = TIV.Config.AnchoredWindCoupling or 0.5
+    local wSpeed   = TIV.Wind.GetSpeed(veh)
+    if coupling > 0 and wSpeed >= 50 then
+        local wForce = TIV.Wind.GetForceVector(veh) * mass * coupling
+        if wForce:Length() > 1 then
+            local dir = wForce:GetNormalized()
+            local mins, maxs = veh:OBBMins(), veh:OBBMaxs()
+            local lw = veh:WorldToLocal(veh:GetPos() + dir)
+            local ex = math.abs(lw.x) * (maxs.x - mins.x) * 0.5
+                   + math.abs(lw.y) * (maxs.y - mins.y) * 0.5
+            local windward = veh:GetPos() - dir * ex * 0.5 + Vector(0, 0, 10)
+            phys:ApplyForceOffset(wForce, windward)
+        end
+    end
 
-    -- Per-stake break caps decay once the failure sequence has started
-    -- (data._stakeWeakenStart/Rate, set there from the measured load and the
-    -- wind overshoot), so sustained over-threshold wind ALWAYS wins
-    -- eventually -- physically, because the spikes progressively tear loose.
+    -- ---------------------------------------------------------------------------
+    -- STAKE SPRING-DAMPER. Soft on purpose: visible lean instead of a rigid
+    -- pin. One-sided: the stake only ever PULLS the mount back toward its
+    -- planted spot -- it never pushes, and at true rest applies nothing.
+    -- ---------------------------------------------------------------------------
+    local k = mass * (TIV.Config.StakeStiffness or 50)
+    local c = math.sqrt(k * mass) * 0.5
+
+    -- Break caps decay once the failure sequence has started
+    -- (data._stakeWeakenStart/Rate), so a sustained storm always wins
+    -- eventually. Before that the caps are finite but undecayed: an extreme
+    -- gust CAN tear a spike early -- load is load.
     local weakenAge = nil
     if data._stakeWeakenStart then
         weakenAge = math.max(0, now - data._stakeWeakenStart)
@@ -435,57 +461,47 @@ function TIV.Anchor.StakeThink(veh, data)
             local drift = delta:Length()
             stake.load  = 0
 
-            -- Rest (or near-rest): the stake carries nothing. A fully
-            -- anchored, calm vehicle gets zero applied force.
-            if drift > 0.75 or stake.carrying then
+            if drift > 0.5 then
                 local v = phys:GetVelocityAtPoint(P)
-                stake.carrying = drift > 0.75
                 local F = delta * -k - v * c
 
-                -- One-sided: the stake only ever PULLS the mount back toward
-                -- its planted spot (it is buried in the ground, not a strut
-                -- from below). If the chassis is already returning on its
-                -- own, let it.
+                -- One-sided pull gate; saturate so a one-tick transient can
+                -- never launch the chassis.
                 if F:Dot(-delta) > 0 then
-                    local need = F:Length()
+                    local cap0 = stake.cap0 or (mass * 600 * 1.2)
+                    local need = math.min(F:Length(), cap0 * 2)
                     stake.load = need
                     phys:ApplyForceOffset(F:GetNormalized() * need, P)
 
-                    -- Break check: only once the failure sequence has handed
-                    -- the stake a finite cap. Before that it holds, however
-                    -- hard the wind leans on it.
-                    local cap = stake.cap
-                    if cap and weakenAge then
+                    -- Break check against the (possibly decaying) cap.
+                    local cap = cap0 * (stake.strength or 1)
+                    if weakenAge then
                         cap = cap * math.exp(-(data._stakeWeakenRate or 0.35) * weakenAge)
-                        if need > cap then
-                            if TIV.Loft and TIV.Loft.TearSpike then
-                                TIV.Loft.TearSpike(veh, data, sd)
-                            end
-                            if debug then
-                                print(string.format("[TIV] stake %d on #%d overloaded: %.0f > cap %.0f",
-                                    sd.index or 0, veh:EntIndex(), need, cap))
-                            end
+                    end
+                    if need > cap then
+                        if TIV.Loft and TIV.Loft.TearSpike then
+                            TIV.Loft.TearSpike(veh, data, sd)
+                        end
+                        if debug then
+                            print(string.format("[TIV] stake %d on #%d overloaded: %.0f > cap %.0f",
+                                sd.index or 0, veh:EntIndex(), need, cap))
                         end
                     end
 
-                    -- Strain feedback against the CURRENT reference cap:
-                    -- creaks past 50%, sparks past 85% -- you hear the spikes
-                    -- giving well before they go.
-                    local ref = cap or stake.cap0
-                    if ref and ref > 0 then
-                        local frac = need / ref
-                        if frac > 0.50 and now > (stake.nextCreak or 0) then
-                            stake.nextCreak = now + 0.5 + math.random() * 0.7
-                            sd.entity:EmitSound("physics/metal/metal_box_strain" .. math.random(1, 4) .. ".wav", 75, math.random(45, 60))
-                        end
-                        if frac > 0.85 and now > (stake.nextSpark or 0) then
-                            stake.nextSpark = now + 0.25
-                            local ed = EffectData()
-                            ed:SetOrigin(P)
-                            ed:SetMagnitude(2)
-                            ed:SetScale(1)
-                            util.Effect("Sparks", ed)
-                        end
+                    -- Strain feedback: creaks past 50%, sparks past 85% --
+                    -- you hear the spikes giving well before they go.
+                    local frac = need / cap
+                    if frac > 0.50 and now > (stake.nextCreak or 0) then
+                        stake.nextCreak = now + 0.5 + math.random() * 0.7
+                        sd.entity:EmitSound("physics/metal/metal_box_strain" .. math.random(1, 4) .. ".wav", 75, math.random(45, 60))
+                    end
+                    if frac > 0.85 and now > (stake.nextSpark or 0) then
+                        stake.nextSpark = now + 0.25
+                        local ed = EffectData()
+                        ed:SetOrigin(P)
+                        ed:SetMagnitude(2)
+                        ed:SetScale(1)
+                        util.Effect("Sparks", ed)
                     end
                 end
             end

@@ -156,7 +156,10 @@ TIV.Config.SpikeRetractDuration = 3.0
 -- is actually carrying x (1 + StakeBreakForce x per-stake variance), then
 -- decays -- so the windward, most-loaded spikes tear out first, physically.
 -- tiv_cheat_godmode_anchors makes stakes unbreakable. StakeStiffness sets how
--- much give the hold has (higher = stiffer = less visible lean).
+-- much give the hold has (higher = stiffer = less visible lean). The anchored
+-- wind load (AnchoredWindCoupling) is applied by the stake think at 66 Hz on
+-- the windward quarter of the chassis, never by the wind think -- two
+-- unsynchronized controllers thrash the body.
 TIV.Config.SpikeForceLimit         = 0
 TIV.Config.StakeBreakForce         = 5.5
 TIV.Config.StakeStiffness          = 50
