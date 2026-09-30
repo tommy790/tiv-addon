@@ -223,8 +223,6 @@ function TIV.Wire.EmergencyStop(veh)
     -- Cancel lower/raise timers
     timer.Remove("TIV_Lower_" .. entIdx)
     timer.Remove("TIV_Raise_" .. entIdx)
-    -- Cancel any cinematic loft flight for this vehicle
-    timer.Remove("TIV_LoftFlight_" .. entIdx)
 
     -- Cancel any active spike animation jobs for this session
     if data.sessionID and TIV.SpikeAnim and TIV.SpikeAnim.ActiveJobs then

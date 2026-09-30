@@ -159,9 +159,9 @@ TIV.Config.BallSocketForceLimit = 0
 TIV.Config.AnchorPivotLimit     = 28
 
 -- LOFT MECHANICS
+-- The loft itself applies no forces: severing the anchors releases the body
+-- and the wind system / tornado mods take it from there.
 TIV.Config.LoftWindThreshold    = 160
-TIV.Config.LoftForceMultiplier  = 50
-TIV.Config.LoftTumbleForce      = 1000
 
 -- Wind force applied to vehicle while anchored
 TIV.Config.AnchoredWindForce    = 0.8
