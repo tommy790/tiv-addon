@@ -150,10 +150,12 @@ TIV.Config.SpikeDriveDuration   = 3.0
 TIV.Config.SpikeRetractDuration = 3.0
 
 -- ANCHOR / BALLSOCKET
--- Force limit of 0 = unbreakable by force. The loft system handles all
--- spike removal explicitly via TIV.Anchor.BreakSpike(). This matches the
--- original design intent and prevents the "vehicle dragged with spikes
--- planted" failure mode where joints silently break under tornado wind.
+-- Force limit of 0 = script-failed only (the loft cascade removes sockets
+-- explicitly, and joints cannot silently break under wind). A real value
+-- makes the anchor sockets breakable under load: when the vortex pushes
+-- harder than the limit, sockets snap physically and the remaining ones
+-- inherit the load -- an emergent, accelerating cascade on top of the
+-- scripted one. tiv_cheat_godmode_anchors always forces 0.
 TIV.Config.SpikeForceLimit      = 0
 TIV.Config.BallSocketForceLimit = 0
 TIV.Config.AnchorPivotLimit     = 28

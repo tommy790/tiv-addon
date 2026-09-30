@@ -12,8 +12,10 @@
 --             allows. Independent of how many spikes are fitted.
 --   Lock    : limited ballsockets between chassis and planted spikes hold the
 --             pulled-down pose (world sockets when no spikes are fitted).
---             Springs at mounts without a spike stay on. Force limit 0 means
---             the loft system is the only thing that ever breaks them.
+--             The pull-down springs STAY attached and tense the whole anchored
+--             state: sockets pin the pose, springs pre-load it down. With a
+--             real force limit (tiv_spike_force > 0) the sockets are breakable
+--             under load; at 0 only the loft system removes them.
 --
 -- The chassis physics object is never frozen, never teleported and keeps its
 -- gravity throughout. Releasing the constraints is what raises the vehicle:
@@ -327,7 +329,26 @@ end
 
 -- ============================================================================
 -- LOCK (limited ballsocket chassis <-> spike at the settled pose)
+-- These are the addon's own anchor sockets, tuned for one job: pin the
+-- settled pose while the airbag springs pre-load it down, and -- when the
+-- player has set a real force limit -- snap under a load the wind puts on
+-- them, so a violent vortex can tear anchors out physically instead of the
+-- failure sequence being purely scripted.
 -- ============================================================================
+-- Force limit for one anchor socket. tiv_spike_force > 0 means the player
+-- asked for breakable anchors: the socket snaps when the load on it exceeds
+-- the limit, and the remaining sockets inherit that load -- a natural,
+-- accelerating cascade on top of the scripted one. 0 keeps them script-only
+-- (the factory default). The godmode cheat always wins.
+local function SocketForceLimit()
+    local god = GetConVar("tiv_cheat_godmode_anchors")
+    if god and god:GetBool() then return 0 end
+    local cv = GetConVar("tiv_spike_force")
+    local limit = cv and cv:GetFloat() or 0
+    if limit and limit > 0 then return limit end
+    return TIV.Config.BallSocketForceLimit or 0
+end
+
 function TIV.Anchor.AttachSingle(veh, data, spikeData, spikeTableIndex)
     if not IsValid(veh) or not IsValid(spikeData.entity) then return end
     spikeData.tableIndex = spikeTableIndex or spikeData.tableIndex
@@ -345,7 +366,7 @@ function TIV.Anchor.AttachSingle(veh, data, spikeData, spikeTableIndex)
     local bs = constraint.AdvBallsocket(
         veh, spike, 0, 0,
         localAttachPos, vector_origin,
-        TIV.Config.BallSocketForceLimit or 0, 0,
+        SocketForceLimit(), 0,
         -limit, -limit, -limit,
          limit,  limit,  limit,
         0, 0, 0,
@@ -402,7 +423,7 @@ function TIV.Anchor.AttachWorld(veh, data)
         local bs = constraint.AdvBallsocket(
             veh, world, 0, 0,
             mountLocal, veh:LocalToWorld(mountLocal),
-            TIV.Config.BallSocketForceLimit or 0, 0,
+            SocketForceLimit(), 0,
             -limit, -limit, -limit,
              limit,  limit,  limit,
             0, 0, 0,

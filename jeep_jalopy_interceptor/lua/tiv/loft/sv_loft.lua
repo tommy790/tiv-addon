@@ -246,11 +246,11 @@ function TIV.Loft.StartDirectionalFailure(veh, data)
     -- its force to an anchored vehicle only while gravityReleased is set), so
     -- the vehicle strains against the spikes that are left.
     --
-    -- THE AIRBAGS GO FIRST, and visibly: the springs that pulled the chassis
-    -- onto its suspension are the soft part of the hold and pads on the ground
-    -- cannot fight lift anyway. They blow at every remaining mount -- sparks
-    -- and a pneumatic pop -- before the first spike lets go. From here only
-    -- the spikes hold the vehicle.
+    -- THE AIRBAGS GO FIRST, and visibly. The springs are still attached and
+    -- TENSE the whole anchored state (FinalizeAnchored keeps them), so this
+    -- pop releases genuinely stored tension: sparks and a pneumatic crack at
+    -- every mount and the chassis physically drops the rest of the way onto
+    -- the sockets. From here only the spikes hold the vehicle.
     local pd = data.pullDown
     if pd then
         local popped = 0

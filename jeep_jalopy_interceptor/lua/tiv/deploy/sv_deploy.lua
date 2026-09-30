@@ -276,7 +276,9 @@ local function CanStartDeploy(veh, data)
     return true
 end
 
--- Locks the settled pose with ballsockets, then lets the springs go.
+-- Locks the settled pose with ballsockets. The pull-down springs STAY
+-- attached and tense: the sockets pin the pose, the springs pre-load it
+-- down, like a real hydraulic anchor rig under tension.
 local function FinalizeAnchored(veh, data)
     if not IsValid(veh) then return end
     if data.state ~= "deploying_spikes" and data.state ~= "lowering" then return end
@@ -285,12 +287,14 @@ local function FinalizeAnchored(veh, data)
     TIV.Anchor.AttachAll(veh, data)
     if TIV.Spikes.GetCount(data) == 0 then
         TIV.Anchor.AttachWorld(veh, data)
-        TIV.Anchor.ReleaseSprings(veh, data)
-    else
-        TIV.Anchor.ReleaseCoveredSprings(veh, data)
     end
     TIV.Anchor.UnfreezeForDeploy(veh)
 
+    -- Keeping the springs is what makes the failure sequence physical: when
+    -- StartDirectionalFailure pops the airbags it releases genuinely stored
+    -- tension, so the chassis really drops onto the sockets, instead of
+    -- deleting constraints that were already gone the moment the anchor
+    -- completed.
     data.anchored   = true
     data.plantedPos = veh:GetPos()
     if TIV.Loft and TIV.Loft.SetAnchoredImmunity then TIV.Loft.SetAnchoredImmunity(veh, true) end
