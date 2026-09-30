@@ -493,13 +493,31 @@ local function ProcessAnchored(entIndex, veh, data)
 
     if not data.plantedPos then data.plantedPos = veh:GetPos() end
 
-    -- Displacement failsafe: the anchors have physically failed if the
-    -- chassis got more than 40 units from where it was planted.
+    -- Displacement failsafe. The stake hold is SOFT by design -- it strains,
+    -- rebounds when the airbags pop, and gives under load -- so a small
+    -- displacement is normal behaviour, not failure. Only a large one means
+    -- the hold has physically lost the body, and then the stakes tear out
+    -- with full FX (the last one lofts, as always) instead of silently
+    -- teleporting the vehicle into the lofted state.
     local distFromPlanted = veh:GetPos():Distance(data.plantedPos)
-    if distFromPlanted > 40 then
-        print(string.format("[TIV] Vehicle #%d lifted %.1f units from ground anchors - triggering instant loft!",
+    if distFromPlanted > (TIV.Config.StakeFailDistance or 150) then
+        print(string.format("[TIV] Vehicle #%d displaced %.1f units from its anchors - hold physically lost!",
             entIndex, distFromPlanted))
-        TIV.Loft.TriggerLoft(veh, data)
+        local live = {}
+        for _, sd in ipairs(data.spikes or {}) do
+            if sd.phase == "deployed" and not sd.failed and IsValid(sd.entity) then
+                live[#live + 1] = sd
+            end
+        end
+        if #live > 0 then
+            -- Tears synchronously; TearSpike triggers the loft itself when
+            -- the last one goes, so state is "lofted" before this returns.
+            for _, sd in ipairs(live) do
+                TIV.Loft.TearSpike(veh, data, sd)
+            end
+        else
+            TIV.Loft.TriggerLoft(veh, data)
+        end
         return
     end
 
@@ -518,7 +536,7 @@ local function ProcessAnchored(entIndex, veh, data)
                 if st.sd == sd then hasStake = true break end
             end
             if not hasStake then
-                if isFailing or distFromPlanted > 20 then
+                if isFailing or distFromPlanted > (TIV.Config.StakeFailDistance or 150) * 0.6 then
                     sd.failed = true
                 else
                     TIV.Anchor.AttachSingle(veh, data, sd, i)

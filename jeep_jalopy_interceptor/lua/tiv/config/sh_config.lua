@@ -157,6 +157,11 @@ TIV.Config.SpikeRetractDuration = 3.0
 -- "use this"). tiv_cheat_godmode_anchors makes stakes unbreakable.
 TIV.Config.SpikeForceLimit      = 0
 TIV.Config.StakeBreakForce      = 5.5
+-- How far the chassis may displace from its planted pose before the hold is
+-- considered physically lost (every remaining stake tears out). Generous on
+-- purpose: the stake hold is soft and visibly strains, gives under load and
+-- rebounds when the airbags pop.
+TIV.Config.StakeFailDistance    = 150
 TIV.Config.AnchorPivotLimit     = 28
 
 -- LOFT MECHANICS
