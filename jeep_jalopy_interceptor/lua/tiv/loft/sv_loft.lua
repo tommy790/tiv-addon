@@ -9,8 +9,12 @@
 --              windward first, each riding on at the extension it had. The
 --              cascade runs faster the further over the threshold the wind is.
 --   Loft     : when the last spike goes (or the chassis has already lifted
---              40 u) the hold is severed, lift is applied at the windward edge
---              with a downwind roll, and gravity plus the storm do the rest.
+--              40 u) the hold is severed. With tiv_loft_cinematic the funnel
+--              holds the chassis in a sustained updraft, carries it downwind
+--              and tumbles it end over end (Into the Storm style) before
+--              physics takes over for the crash; with 0 a single launch
+--              impulse at the windward edge is used instead. Either way
+--              gravity plus the storm do the rest.
 --   Reset    : 15 s later the pistons still aboard stroke home, lost ones are
 --              replaced and the vehicle is idle.
 -- ============================================================================
@@ -31,6 +35,18 @@ end
 CreateConVar("tiv_loft_release_spikes", "0",
     { FCVAR_ARCHIVE, FCVAR_NOTIFY, FCVAR_REPLICATED },
     "If 1, spikes fly free as debris on loft. If 0, they stay on the vehicle at the extension they were torn out at.")
+
+-- Into the Storm (Titus) style loft: instead of one launch impulse the funnel
+-- holds the vehicle in a sustained updraft, carries it downwind and tumbles it
+-- end over end for a few seconds before physics takes over for the crash.
+CreateConVar("tiv_loft_cinematic", "1",
+    { FCVAR_ARCHIVE, FCVAR_NOTIFY, FCVAR_REPLICATED },
+    "If 1, lofts fly cinematically: sustained updraft carry and continuous end-over-end tumbling. If 0, the legacy single-impulse loft is used.")
+
+CreateConVar("tiv_loft_flight_time", "4.5",
+    { FCVAR_ARCHIVE, FCVAR_REPLICATED },
+    "Seconds the updraft carries a lofted interceptor before physics takes over for the crash.",
+    1, 10)
 
 -- ============================================================================
 -- EXTERNAL TORNADO MOD IMMUNITY HELPERS
@@ -308,6 +324,163 @@ function TIV.Loft.StartDirectionalFailure(veh, data)
 end
 
 -- ============================================================================
+-- CINEMATIC FLIGHT (Into the Storm / Titus style)
+--
+-- The launch impulse alone dies out in well under a second, which reads as a
+-- punt rather than a loft. In the film the funnel HOLDS the vehicle: seconds
+-- of lift, a big downwind throw, and continuous end-over-end tumbling before
+-- it finally drops out of the circulation and crashes. This reproduces that
+-- with a short per-tick flight controller:
+--
+--   lift   : over-compensates gravity early, gives up late, so the flight
+--            arcs up and is already falling as physics resumes
+--   carry  : constant downwind force with a horizontal speed cap
+--   tumble : angular velocity is steered toward a rolling axis that itself
+--            wanders every second -- chaotic cartwheeling, not a fixed spin
+--
+-- Once the flight window ends (or the deck gets close) the controller hands
+-- the body straight back to the physics engine and WatchLanding covers the
+-- impact. Nothing here touches a vehicle that is not in the "lofted" state.
+-- ============================================================================
+local FLIGHT_CARRY_ACCEL  = 260            -- u/s^2 of downwind push
+local FLIGHT_CARRY_MAX    = 700            -- u/s horizontal speed cap
+local FLIGHT_TUMBLE_SPEED = math.rad(150)  -- ~0.4 revolutions per second
+local FLIGHT_TICK         = 0.02
+
+function TIV.Loft.BeginCinematicFlight(veh, data)
+    if not IsValid(veh) then return end
+    local phys = veh:GetPhysicsObject()
+    if not IsValid(phys) then return end
+
+    local entIdx = veh:EntIndex()
+    local mass = phys:GetMass()
+
+    local windDir = TIV.Wind.GetDirection(veh)
+    if not isvector(windDir) or windDir:LengthSqr() < 0.01 then windDir = veh:GetForward() end
+    windDir = Vector(windDir.x, windDir.y, 0):GetNormalized()
+
+    -- Violent rip-off at the windward edge, stronger than the legacy impulse:
+    -- the nose pitches up hard before the updraft takes over.
+    local mins, maxs = veh:OBBMins(), veh:OBBMaxs()
+    local localWind  = veh:WorldToLocal(veh:GetPos() + windDir)
+    local halfExtent = math.abs(localWind.x) * (maxs.x - mins.x) * 0.5
+                     + math.abs(localWind.y) * (maxs.y - mins.y) * 0.5
+    local windwardEdge = veh:GetPos() - windDir * halfExtent * 0.5
+    phys:ApplyForceOffset(Vector(0, 0, 1) * mass * 2600, windwardEdge)
+    phys:ApplyForceCenter(windDir * mass * 420)
+
+    local flightTime = 4.5
+    local cvTime = GetConVar("tiv_loft_flight_time")
+    if cvTime then flightTime = math.Clamp(cvTime:GetFloat(), 1, 10) end
+
+    local start = CurTime()
+    -- Primary tumble axis: end-over-end across the wind (wind x up). It is
+    -- perturbed once a second below so the cartwheel drifts and never reads
+    -- as a drill spin about one fixed axis.
+    local tumbleAxis = windDir:Cross(Vector(0, 0, 1))
+    if tumbleAxis:LengthSqr() < 0.01 then tumbleAxis = Vector(1, 0, 0) end
+    tumbleAxis:Normalize()
+    local nextWander = start + 1.0
+
+    timer.Create("TIV_LoftFlight_" .. entIdx, FLIGHT_TICK, 0, function()
+        if not IsValid(veh) or data.state ~= "lofted" then
+            timer.Remove("TIV_LoftFlight_" .. entIdx)
+            return
+        end
+        -- Re-fetched every tick: the engine can recreate the physics object
+        -- mid-flight, and driving a stale one would silently do nothing.
+        local phys = veh:GetPhysicsObject()
+        if not IsValid(phys) then
+            timer.Remove("TIV_LoftFlight_" .. entIdx)
+            return
+        end
+
+        local frac = math.Clamp((CurTime() - start) / flightTime, 0, 1)
+
+        -- Sporadic metal creaks while the storm carries it.
+        if math.random() < 0.02 then
+            veh:EmitSound("physics/metal/metal_box_strain" .. math.random(1, 4) .. ".wav", 75, math.random(50, 70))
+        end
+
+        -- Close to the deck: stop driving the body and let physics resolve
+        -- the crash naturally.
+        local groundTr = util.TraceLine({
+            start  = veh:GetPos(),
+            endpos = veh:GetPos() - Vector(0, 0, 120),
+            mask   = MASK_SOLID_BRUSHONLY,
+            filter = veh,
+        })
+
+        if not groundTr.Hit then
+            -- Sustained updraft: 1.18x gravity compensation arcs it upward,
+            -- the taper to 0.35x is what brings it out of the funnel.
+            local lift = Lerp(frac, 1.18, 0.35)
+            phys:ApplyForceCenter(Vector(0, 0, 1) * mass * 600 * lift)
+
+            -- Downwind carry with a horizontal speed cap.
+            local vel = phys:GetVelocity()
+            local horiz = Vector(vel.x, vel.y, 0)
+            if horiz:Dot(windDir) < FLIGHT_CARRY_MAX then
+                phys:ApplyForceCenter(windDir * mass * FLIGHT_CARRY_ACCEL)
+            end
+
+            -- Continuous end-over-end tumble. Steering by angular-velocity
+            -- delta keeps the tumble RATE right regardless of chassis inertia.
+            if CurTime() >= nextWander then
+                nextWander = CurTime() + 1.0
+                tumbleAxis = (tumbleAxis + VectorRand() * 0.35):GetNormalized()
+            end
+            local cur = phys:GetAngleVelocity()
+            phys:AddAngleVelocity((tumbleAxis * FLIGHT_TUMBLE_SPEED - cur) * 0.06)
+        end
+
+        if frac >= 1 then
+            timer.Remove("TIV_LoftFlight_" .. entIdx)
+            TIV.Loft.WatchLanding(veh, entIdx)
+        end
+    end)
+end
+
+-- Polls until the lofted body is back on the deck and settled, then plays the
+-- impact: local screenshake, tearing metal and sparks. Safety-capped at 20 s.
+function TIV.Loft.WatchLanding(veh, entIdx)
+    timer.Create("TIV_LoftLand_" .. entIdx, 0.1, 200, function()
+        local live = Entity(entIdx)
+        if not IsValid(live) then
+            timer.Remove("TIV_LoftLand_" .. entIdx)
+            return
+        end
+        local p = live:GetPhysicsObject()
+        if not IsValid(p) then
+            timer.Remove("TIV_LoftLand_" .. entIdx)
+            return
+        end
+
+        local tr = util.TraceLine({
+            start  = live:GetPos(),
+            endpos = live:GetPos() - Vector(0, 0, 60),
+            mask   = MASK_SOLID_BRUSHONLY,
+            filter = live,
+        })
+        local vel = p:GetVelocity()
+
+        if (tr.Hit and math.abs(vel.z) < 40) or p:IsAsleep() then
+            timer.Remove("TIV_LoftLand_" .. entIdx)
+
+            util.ScreenShake(live:GetPos(), 15, 12, 1.2, 900)
+            live:EmitSound("physics/metal/metal_box_break1.wav", 95, 55)
+            live:EmitSound("physics/metal/metal_sheet_impact_hard" .. math.random(6, 8) .. ".wav", 95, math.random(60, 75))
+
+            local ed = EffectData()
+            ed:SetOrigin(live:GetPos())
+            ed:SetMagnitude(10)
+            ed:SetScale(4)
+            util.Effect("Sparks", ed)
+        end
+    end)
+end
+
+-- ============================================================================
 -- TRIGGER FULL LOFT
 -- Clean single launch impulse. Natural Source gravity & storm physics handle flight.
 -- ============================================================================
@@ -357,30 +530,40 @@ function TIV.Loft.TriggerLoft(veh, data)
         phys:EnableMotion(true)
         phys:Wake()
 
-        -- The storm gets under the windward side: the lift acts at the
-        -- windward edge of the chassis, not its centre, so the vehicle pitches
-        -- up on that side and rolls downwind (rotation axis wind x up) with
-        -- only a little randomness, instead of a centred fling with a random
-        -- spin.
-        local mass    = phys:GetMass()
-        local windDir = TIV.Wind.GetDirection(veh)
-        if not isvector(windDir) or windDir:LengthSqr() < 0.01 then windDir = veh:GetForward() end
-        windDir = Vector(windDir.x, windDir.y, 0):GetNormalized()
+        local cinematicCv = GetConVar("tiv_loft_cinematic")
+        if cinematicCv and cinematicCv:GetBool() then
+            -- Into the Storm style: the funnel holds and tumbles the vehicle
+            -- for a few seconds (see BeginCinematicFlight) before physics
+            -- takes over for the crash.
+            TIV.Loft.BeginCinematicFlight(veh, data)
+        else
+            -- Legacy single-impulse loft.
 
-        local mins, maxs = veh:OBBMins(), veh:OBBMaxs()
-        local localWind  = veh:WorldToLocal(veh:GetPos() + windDir)
-        local halfExtent = math.abs(localWind.x) * (maxs.x - mins.x) * 0.5
-                         + math.abs(localWind.y) * (maxs.y - mins.y) * 0.5
-        local windwardEdge = veh:GetPos() - windDir * halfExtent * 0.5
+            -- The storm gets under the windward side: the lift acts at the
+            -- windward edge of the chassis, not its centre, so the vehicle pitches
+            -- up on that side and rolls downwind (rotation axis wind x up) with
+            -- only a little randomness, instead of a centred fling with a random
+            -- spin.
+            local mass    = phys:GetMass()
+            local windDir = TIV.Wind.GetDirection(veh)
+            if not isvector(windDir) or windDir:LengthSqr() < 0.01 then windDir = veh:GetForward() end
+            windDir = Vector(windDir.x, windDir.y, 0):GetNormalized()
 
-        local upForce   = Vector(0, 0, 1) * mass * (TIV.Config.LoftForceMultiplier or 1200)
-        local windForce = TIV.Wind.GetForceVector(veh) * mass * 0.65
-        local rollAxis  = windDir:Cross(Vector(0, 0, 1))
-        local tumble    = (rollAxis + VectorRand() * 0.2):GetNormalized() * (TIV.Config.LoftTumbleForce or 350) * mass
+            local mins, maxs = veh:OBBMins(), veh:OBBMaxs()
+            local localWind  = veh:WorldToLocal(veh:GetPos() + windDir)
+            local halfExtent = math.abs(localWind.x) * (maxs.x - mins.x) * 0.5
+                             + math.abs(localWind.y) * (maxs.y - mins.y) * 0.5
+            local windwardEdge = veh:GetPos() - windDir * halfExtent * 0.5
 
-        phys:ApplyForceOffset(upForce, windwardEdge)
-        phys:ApplyForceCenter(windForce)
-        phys:ApplyTorqueCenter(tumble)
+            local upForce   = Vector(0, 0, 1) * mass * (TIV.Config.LoftForceMultiplier or 1200)
+            local windForce = TIV.Wind.GetForceVector(veh) * mass * 0.65
+            local rollAxis  = windDir:Cross(Vector(0, 0, 1))
+            local tumble    = (rollAxis + VectorRand() * 0.2):GetNormalized() * (TIV.Config.LoftTumbleForce or 350) * mass
+
+            phys:ApplyForceOffset(upForce, windwardEdge)
+            phys:ApplyForceCenter(windForce)
+            phys:ApplyTorqueCenter(tumble)
+        end
     end
 
     -- 4. Spikes: torn ones already ride with the chassis at their extension.
