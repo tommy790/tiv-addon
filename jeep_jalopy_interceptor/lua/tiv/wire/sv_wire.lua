@@ -693,6 +693,11 @@ function TIV.Wire.ResetOutputsForEnt(ent)
     trigger(ent, "SystemFailure", 0)
     trigger(ent, "EmergencyState", 0)
 
+    -- Progression outputs were not reset here, so an unlinked controller kept
+    -- advertising the previous driver's balance/upgrade flags forever.
+    trigger(ent, "Points",              0)
+    trigger(ent, "TotalPoints",         0)
+    trigger(ent, "Intercepts",          0)
     trigger(ent, "CurrentIntercepts",   0)
     trigger(ent, "TotalIntercepts",     0)
     trigger(ent, "UpgradeCount",        0)
@@ -700,6 +705,7 @@ function TIV.Wire.ResetOutputsForEnt(ent)
     trigger(ent, "HasAngledSpikes",     0)
     trigger(ent, "HasSideArmor",        0)
     trigger(ent, "HasFrontArmor",       0)
+    trigger(ent, "HasPathScreen",       0)
 
     trigger(ent, "ArmorCount",          0)
     trigger(ent, "ArmorProtection",     0)

@@ -113,8 +113,13 @@ function TIV.CustomComponents.SpawnArmorProps(veh, config, unlockedUpgrades)
 
                     if constraint and constraint.NoCollide then
                         constraint.NoCollide(veh, prop, 0, 0)
-                        if data and data.spikes then
-                            for _, sd in ipairs(data.spikes) do
+                        -- Armor must also never collide with the vehicle's spikes.
+                        -- This used to read an undefined `data` global, so the
+                        -- guard was always false and the spike nocollides were
+                        -- never created; panels could snag on planted anchors.
+                        local deployData = TIV.Deploy and TIV.Deploy.GetState and TIV.Deploy.GetState(veh)
+                        if deployData and deployData.spikes then
+                            for _, sd in ipairs(deployData.spikes) do
                                 if IsValid(sd.entity) then
                                     constraint.NoCollide(sd.entity, prop, 0, 0)
                                 end

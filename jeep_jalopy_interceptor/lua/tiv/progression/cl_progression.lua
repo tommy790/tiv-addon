@@ -57,7 +57,9 @@ net.Receive("TIV_InterceptAwarded", function()
 end)
 
 net.Receive("TIV_PointsAwarded", function()
-    local amount      = net.ReadUInt(8)
+    -- Server sends the amount as 16 bits: the +200 / +1000 sandbox grants
+    -- overflowed the old 8-bit field and never reached this handler.
+    local amount      = net.ReadUInt(16)
     local points      = net.ReadUInt(16)
     local totalPoints = net.ReadUInt(16)
     local intercepts  = net.ReadUInt(16)

@@ -153,4 +153,22 @@ hook.Add("PlayerButtonDown", "TIV_ClientDeployKey", function(ply, button)
     net.SendToServer()
 end)
 
+-- ============================================================================
+-- CONSOLE TOGGLE
+-- The settings menu's "Toggle Deploy / Retract" buttons ran `tiv_toggle`,
+-- which was never registered anywhere, so they silently did nothing.
+-- This is the console equivalent of pressing the deploy key.
+-- ============================================================================
+concommand.Add("tiv_toggle", function()
+    local ply = LocalPlayer()
+    if not IsValid(ply) then return end
+    if not IsValid(TIV.Deploy.ResolveVehicle(ply)) then
+        notification.AddLegacy("[TIV] Enter a supported vehicle first!", NOTIFY_ERROR, 3)
+        return
+    end
+
+    net.Start("TIV_DeployRequest")
+    net.SendToServer()
+end)
+
 print("[TIV] Deploy client loaded")

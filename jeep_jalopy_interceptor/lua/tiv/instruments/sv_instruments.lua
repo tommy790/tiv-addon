@@ -42,8 +42,10 @@ timer.Create("TIV_InstrumentUpdate", TIV.Config.InstrumentUpdateRate, 0, functio
                 local windSpeed = TIV.Wind.GetSpeed(veh)
                 local windDir   = TIV.Wind.GetDirection(veh)
                 -- Only meaningful while anchored; saves player confusion.
+                -- Pass the vehicle so the per-vehicle loft threshold (upgrades,
+                -- armor) is honoured instead of the bare config default.
                 local stress    = (data.state == "anchored")
-                    and TIV.Loft.CalculateStress(windSpeed) or 0
+                    and TIV.Loft.CalculateStress(windSpeed, veh) or 0
 
                 packet = {
                     windSpeed         = windSpeed,

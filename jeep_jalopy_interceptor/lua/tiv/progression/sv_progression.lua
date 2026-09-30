@@ -109,10 +109,11 @@ function TIV.Progression.SyncToPlayer(ply)
     local profile = TIV.Progression.GetPlayerProfile(ply)
     if not profile then return end
 
+    -- Values are capped at 65535 so they can never overflow the 16-bit fields.
     net.Start("TIV_SyncProgression")
-        net.WriteUInt(profile.points or 0, 16)
-        net.WriteUInt(profile.total_points or 0, 16)
-        net.WriteUInt(profile.intercepts or 0, 16)
+        net.WriteUInt(math.min(profile.points or 0, 65535), 16)
+        net.WriteUInt(math.min(profile.total_points or 0, 65535), 16)
+        net.WriteUInt(math.min(profile.intercepts or 0, 65535), 16)
 
         local count = 0
         for id, state in pairs(profile.unlocked_upgrades or {}) do
@@ -137,6 +138,7 @@ function TIV.Progression.AwardIntercept(ply, reason)
     if not profile then return end
 
     profile.intercepts = (profile.intercepts or 0) + 1
+    profile.intercepts = math.min(profile.intercepts, 65535)
     profile.total_intercepts = profile.intercepts
 
     TIV.Progression.SavePlayerProfile(ply)
@@ -161,21 +163,25 @@ end
 -- ============================================================================
 function TIV.Progression.AwardPoints(ply, amount, reason)
     if not IsValid(ply) or amount <= 0 then return end
+    -- Clamp to the 16-bit wire ceiling. This used to be written back out as an
+    -- 8-bit field, so the sandbox +200 / +1000 point buttons overflowed
+    -- net.WriteUInt server-side and the grant silently failed.
+    amount = math.Clamp(math.floor(amount), 1, 65535)
     local profile = TIV.Progression.GetPlayerProfile(ply)
     if not profile then return end
 
-    profile.points       = (profile.points or 0) + amount
-    profile.total_points = (profile.total_points or 0) + amount
+    profile.points       = math.min((profile.points or 0) + amount, 65535)
+    profile.total_points = math.min((profile.total_points or 0) + amount, 65535)
     profile.current_intercepts = profile.points
 
     TIV.Progression.SavePlayerProfile(ply)
     TIV.Progression.SyncToPlayer(ply)
 
     net.Start("TIV_PointsAwarded")
-        net.WriteUInt(amount, 8)
-        net.WriteUInt(profile.points, 16)
-        net.WriteUInt(profile.total_points, 16)
-        net.WriteUInt(profile.intercepts or 0, 16)
+        net.WriteUInt(amount, 16)
+        net.WriteUInt(profile.points or 0, 16)
+        net.WriteUInt(profile.total_points or 0, 16)
+        net.WriteUInt(math.min(profile.intercepts or 0, 65535), 16)
         net.WriteString(reason or "Severe Storm Intercept Hold")
     net.Send(ply)
 

@@ -107,7 +107,7 @@ local PRESETS = {
         desc        = "Resets all spike counts, forces, timings, and compatibility settings back to standard out-of-the-box defaults.",
         cvars = {
             tiv_spike_count                = 6,
-            tiv_spike_force                = 80000,
+            tiv_spike_force                = 0,      -- factory default: 0 = unbreakable (loft system breaks anchors explicitly)
             tiv_loft_wind_threshold        = 180,
             tiv_hide_spikes                = 0,
             tiv_wire_hide_controller       = 0,

@@ -285,7 +285,7 @@ function TIV.ResolveOwner(veh)
     if not IsValid(ply) and veh.CPPIGetOwner then
         ply = veh:CPPIGetOwner()
     end
-    if not IsValid(ply) and game.SinglePlayer then
+    if not IsValid(ply) and game.SinglePlayer() then
         local humans = player.GetHumans()
         ply = humans and humans[1] or nil
     end
